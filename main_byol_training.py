@@ -10,12 +10,13 @@ Usage:
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
 import argparse
 import os
 import sys
 import time
 import math
+from datetime import datetime
+import numpy as np
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,7 +30,7 @@ from utils.train_byol import (
 from utils.evaluation import evaluate_all, print_evaluation_results
 from utils.byol_monitor import BYOLMonitor, visualize_latent_space
 from utils.dataloader_utils import prepare_clean_data, create_dataloaders
-import numpy as np
+
 
 
 class CosineAnnealingWarmUpRestarts(optim.lr_scheduler._LRScheduler):
@@ -103,8 +104,7 @@ def load_wafer_data(data_configs, use_filter=True, use_density_aware=False, use_
         info: List of filter info dicts
     """
     if not data_configs or len(data_configs) == 0:
-        print("⚠️  No data configs provided, creating dummy data...")
-        return None, None, None
+        raise ValueError("data_configs must be provided with at least one dataset")
 
     # Load and clean data
     wafer_maps, labels, info = prepare_clean_data(
@@ -116,36 +116,6 @@ def load_wafer_data(data_configs, use_filter=True, use_density_aware=False, use_
     )
 
     return wafer_maps, labels, info
-
-
-def create_dummy_dataloader(n_samples=1000, batch_size=256, wafer_size=128):
-    """
-    Create dummy dataloader for testing
-    DEPRECATED: Use load_wafer_data + create_dataloaders instead
-
-    Args:
-        n_samples: number of samples
-        batch_size: batch size
-        wafer_size: wafer map size
-
-    Returns:
-        train_loader, val_loader
-    """
-    print(f"⚠️  Creating dummy dataset ({n_samples} samples)...")
-    print("   For real data, provide data_configs in config")
-
-    # Create dummy wafer maps
-    train_data = torch.rand(n_samples, 1, wafer_size, wafer_size)
-    val_data = torch.rand(n_samples // 5, 1, wafer_size, wafer_size)
-
-    # Create dataloaders
-    train_dataset = TensorDataset(train_data)
-    val_dataset = TensorDataset(val_data)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-
-    return train_loader, val_loader
 
 
 def train_byol_wafer(config):
@@ -169,45 +139,31 @@ def train_byol_wafer(config):
     # Data loaders
     print("\nPreparing data...")
 
-    # Check if real data configs are provided
-    if 'data_configs' in config and config['data_configs'] is not None:
-        # Load real wafer data
-        wafer_maps, labels, info = load_wafer_data(
-            data_configs=config['data_configs'],
-            use_filter=config.get('use_filter', True),
-            use_density_aware=config.get('use_density_aware', False),
-            use_region_aware=config.get('use_region_aware', False)
-        )
+    # Load wafer data
+    wafer_maps, labels, _ = load_wafer_data(
+        data_configs=config['data_configs'],
+        use_filter=config.get('use_filter', True),
+        use_density_aware=config.get('use_density_aware', False),
+        use_region_aware=config.get('use_region_aware', False)
+    )
 
-        if wafer_maps is None or len(wafer_maps) == 0:
-            print("❌ Failed to load data, falling back to dummy data")
-            train_loader, val_loader = create_dummy_dataloader(
-                n_samples=config['n_samples'],
-                batch_size=config['batch_size'],
-                wafer_size=config['wafer_size']
-            )
-        else:
-            # Create dataloaders from real data
-            # IMPORTANT: use_augmentation=False because BYOL applies augmentation in training loop
-            train_loader, val_loader = create_dataloaders(
-                wafer_maps=wafer_maps,
-                labels=labels,
-                batch_size=config['batch_size'],
-                target_size=(config['wafer_size'], config['wafer_size']),
-                test_size=config.get('test_size', 0.2),
-                use_filter=False,  # Already filtered in prepare_clean_data
-                filter_on_the_fly=False,
-                filter_params=None,
-                use_density_aware=False,
-                use_augmentation=False  # BYOL applies augmentation in train_byol_epoch
-            )
-    else:
-        # Use dummy data
-        train_loader, val_loader = create_dummy_dataloader(
-            n_samples=config['n_samples'],
-            batch_size=config['batch_size'],
-            wafer_size=config['wafer_size']
-        )
+    if wafer_maps is None or len(wafer_maps) == 0:
+        raise ValueError("Failed to load data. Please check your data_configs paths.")
+
+    # Create dataloaders from real data
+    # IMPORTANT: use_augmentation=False because BYOL applies augmentation in training loop
+    train_loader, val_loader = create_dataloaders(
+        wafer_maps=wafer_maps,
+        labels=labels,
+        batch_size=config['batch_size'],
+        target_size=(config['wafer_size'], config['wafer_size']),
+        test_size=config.get('test_size', 0.2),
+        use_filter=False,  # Already filtered in prepare_clean_data
+        filter_on_the_fly=False,
+        filter_params=None,
+        use_density_aware=False,
+        use_augmentation=False  # BYOL applies augmentation in train_byol_epoch
+    )
 
     print(f"Train samples: {len(train_loader.dataset)}")
     print(f"Val samples: {len(val_loader.dataset)}")
@@ -413,18 +369,22 @@ def train_byol_wafer(config):
     print("\nTraining completed!")
 
 
-def get_default_config():
+def get_default_config(path):
     """Get default configuration"""
     config = {
-        # Data - Real wafer data (set to None to use dummy data)
-        'data_configs': None,  # Example: [{"path": "data.npz", "name": "product1"}]
+        # Data - Multiple wafer data sources
+        'data_configs': [
+            {"path": f"{path}/dataset/extract_data/dataset/root/root_map_data_goodbinmap.npz", "name": "Root"},
+            {"path": f"{path}/dataset/extract_data/dataset/rose/rose_map_data_goodbinmap.npz", "name": "Rose"},
+            {"path": f"{path}/dataset/extract_data/dataset/santa/santa_map_data_goodbinmap.npz", "name": "Santa"},
+            {"path": f"{path}/dataset/extract_data/dataset/zuma_pro/zuma_pro_map_data_goodbinmap.npz", "name": "Zuma_pro"}
+        ],
         'use_filter': True,
         'use_density_aware': False,
         'use_region_aware': False,
         'test_size': 0.2,
 
-        # Data - Dummy fallback
-        'n_samples': 5000,
+        # Data parameters
         'wafer_size': 128,
         'batch_size': 256,
 
@@ -487,8 +447,13 @@ def main():
 
     args = parser.parse_args()
 
+    path = '/mnt/kh0213.jang/Documents/wm811k'
+    base_path = path + "/clustering/pth_file"
+    today = datetime.today()
+    result = today.strftime("%y%m%d")
+
     # Get default config
-    config = get_default_config()
+    config = get_default_config(path=path)
 
     # Override with command line arguments
     if args.resume is not None:
