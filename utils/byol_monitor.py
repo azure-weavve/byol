@@ -7,6 +7,9 @@ Tracks and logs:
 - Feature statistics (for collapse detection)
 - Periodic evaluation metrics
 - Visualization (t-SNE/UMAP)
+- Support for resuming training (previous history + current)
+
+PyTorch 1.4.0 compatible
 """
 
 import torch
@@ -19,16 +22,37 @@ import json
 import os
 
 
+# Custom JSON Encoder
+class NumpyEncoder(json.JSONEncoder):
+    """numpy, torch 타입을 자동으로 처리하는 JSON encoder"""
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.floating, np.integer)):
+            return obj.item()
+        elif isinstance(obj, torch.Tensor):
+            return obj.cpu().detach().numpy().tolist()
+        elif isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        return json.JSONEncoder.default(self, obj)
+
+
 class BYOLMonitor:
     """
     Monitor BYOL training progress
+    
+    Features:
+    - 학습 중 metrics 자동 저장
+    - 재개 학습 시 이전 history 자동 로드
+    - 통합된 history로 plot 생성 (첫 epoch부터 현재까지)
     """
-    def __init__(self, log_dir='logs', eval_frequency=10, save_plots=True):
+    def __init__(self, log_dir='logs', eval_frequency=10, save_plots=True, resume=False):
         """
         Args:
             log_dir: directory to save logs and plots
             eval_frequency: evaluate every N epochs
             save_plots: save plots to disk
+            resume: True면 이전 history 자동 로드
         """
         self.log_dir = log_dir
         self.eval_frequency = eval_frequency
@@ -37,15 +61,46 @@ class BYOLMonitor:
         # Create log directory
         os.makedirs(log_dir, exist_ok=True)
 
-        # History
+        # History (이전 데이터 포함)
         self.history = defaultdict(list)
-
+        
         # Collapse detection
         self.collapse_warnings = []
+        
+        # ✅ 재개 학습 시 이전 history 자동 로드
+        if resume:
+            self._load_previous_history()
+
+    def _load_previous_history(self):
+        """이전 학습의 history 로드"""
+        history_path = os.path.join(self.log_dir, 'history.json')
+        
+        if os.path.exists(history_path):
+            try:
+                with open(history_path, 'r') as f:
+                    previous_history = json.load(f)
+                
+                # 이전 데이터를 현재 history에 로드
+                for key, values in previous_history.items():
+                    if isinstance(values, list):
+                        self.history[key] = values.copy()
+                    else:
+                        self.history[key] = values
+                
+                n_epochs = len(self.history.get('epoch', []))
+                print(f"✅ Previous history loaded: {n_epochs} epochs")
+                
+            except Exception as e:
+                print(f"⚠️  Failed to load previous history: {e}")
+                self.history = defaultdict(list)
+        else:
+            print(f"ℹ️  No previous history found (new training)")
 
     def log_epoch(self, epoch, train_loss, val_loss, learning_rate, tau, **kwargs):
         """
         Log epoch metrics
+        
+        ✅ 자동으로 기존 데이터와 합쳐짐
 
         Args:
             epoch: epoch number
@@ -106,6 +161,8 @@ class BYOLMonitor:
     def plot_training_curves(self, save_path=None):
         """
         Plot training and validation loss curves
+        
+        ✅ 재개 학습 시 이전 데이터(첫 epoch) + 현재 데이터를 함께 표시
 
         Args:
             save_path: path to save plot (if None, use log_dir)
@@ -113,66 +170,76 @@ class BYOLMonitor:
         if save_path is None:
             save_path = os.path.join(self.log_dir, 'training_curves.png')
 
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
         # Loss curves
         if len(self.history['train_loss']) > 0:
             epochs = self.history['epoch']
-            axes[0, 0].plot(epochs, self.history['train_loss'], label='Train Loss', marker='o')
-            axes[0, 0].plot(epochs, self.history['val_loss'], label='Val Loss', marker='s')
+            axes[0, 0].plot(epochs, self.history['train_loss'], 
+                           label='Train Loss', marker='o', linewidth=2, color='#1f77b4')
+            axes[0, 0].plot(epochs, self.history['val_loss'], 
+                           label='Val Loss', marker='s', linewidth=2, color='#ff7f0e')
             axes[0, 0].set_xlabel('Epoch')
             axes[0, 0].set_ylabel('Loss')
-            axes[0, 0].set_title('Training and Validation Loss')
+            axes[0, 0].set_title('Training and Validation Loss (전체 학습 기록)')
             axes[0, 0].legend()
-            axes[0, 0].grid(True)
+            axes[0, 0].grid(True, alpha=0.3)
 
         # Learning rate
         if len(self.history['learning_rate']) > 0:
             epochs = self.history['epoch']
-            axes[0, 1].plot(epochs, self.history['learning_rate'], marker='o', color='green')
+            axes[0, 1].plot(epochs, self.history['learning_rate'], 
+                           marker='o', color='green', linewidth=2)
             axes[0, 1].set_xlabel('Epoch')
             axes[0, 1].set_ylabel('Learning Rate')
-            axes[0, 1].set_title('Learning Rate Schedule')
+            axes[0, 1].set_title('Learning Rate Schedule (전체 학습 기록)')
             axes[0, 1].set_yscale('log')
-            axes[0, 1].grid(True)
+            axes[0, 1].grid(True, alpha=0.3)
 
         # Tau schedule
         if len(self.history['tau']) > 0:
             epochs = self.history['epoch']
-            axes[1, 0].plot(epochs, self.history['tau'], marker='o', color='orange')
+            axes[1, 0].plot(epochs, self.history['tau'], 
+                           marker='o', color='orange', linewidth=2)
             axes[1, 0].set_xlabel('Epoch')
             axes[1, 0].set_ylabel('Tau (EMA Momentum)')
-            axes[1, 0].set_title('Tau Schedule')
-            axes[1, 0].grid(True)
+            axes[1, 0].set_title('Tau Schedule (전체 학습 기록)')
+            axes[1, 0].grid(True, alpha=0.3)
 
         # Collapse detection
         if len(self.history['feat_std']) > 0:
             epochs = self.history['epoch']
             ax1 = axes[1, 1]
-            ax1.plot(epochs, self.history['feat_std'], marker='o', color='blue', label='Feature Std')
+            ax1.plot(epochs, self.history['feat_std'], 
+                    marker='o', color='blue', linewidth=2, label='Feature Std')
             ax1.set_xlabel('Epoch')
             ax1.set_ylabel('Feature Std', color='blue')
             ax1.tick_params(axis='y', labelcolor='blue')
-            ax1.grid(True)
+            ax1.grid(True, alpha=0.3)
+            ax1.legend(loc='upper left')
 
             ax2 = ax1.twinx()
-            ax2.plot(epochs, self.history['avg_cos_sim'], marker='s', color='red', label='Avg Cos Sim')
+            ax2.plot(epochs, self.history['avg_cos_sim'], 
+                    marker='s', color='red', linewidth=2, label='Avg Cos Sim')
             ax2.set_ylabel('Avg Cosine Similarity', color='red')
             ax2.tick_params(axis='y', labelcolor='red')
-
-            axes[1, 1].set_title('Collapse Detection Metrics')
+            ax2.legend(loc='upper right')
+            
+            axes[1, 1].set_title('Collapse Detection (전체 학습 기록)')
 
         plt.tight_layout()
 
         if self.save_plots:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Training curves saved to {save_path}")
+            print(f"✅ Training curves saved to {save_path}")
 
         plt.close()
 
     def plot_evaluation_metrics(self, save_path=None):
         """
         Plot evaluation metrics over time
+        
+        ✅ 재개 학습 시 이전 데이터 + 현재 데이터 함께 표시
 
         Args:
             save_path: path to save plot
@@ -181,10 +248,11 @@ class BYOLMonitor:
             save_path = os.path.join(self.log_dir, 'evaluation_metrics.png')
 
         # Find evaluation metrics
-        eval_keys = [k for k in self.history.keys() if k.startswith(('retrieval_', 'clustering_', 'rotation_'))]
+        eval_keys = [k for k in self.history.keys() 
+                     if k.startswith(('retrieval_', 'clustering_', 'rotation_'))]
 
         if len(eval_keys) == 0:
-            print("No evaluation metrics to plot")
+            print("ℹ️  No evaluation metrics to plot")
             return
 
         # Create subplots
@@ -192,7 +260,7 @@ class BYOLMonitor:
         n_cols = 3
         n_rows = (n_metrics + n_cols - 1) // n_cols
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5*n_rows))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 5*n_rows))
         axes = axes.flatten() if n_rows > 1 else [axes] if n_cols == 1 else axes
 
         for i, key in enumerate(eval_keys):
@@ -202,11 +270,11 @@ class BYOLMonitor:
             data = self.history[key]
             if len(data) > 0:
                 epochs, values = zip(*data)
-                axes[i].plot(epochs, values, marker='o')
+                axes[i].plot(epochs, values, marker='o', linewidth=2, color='#1f77b4')
                 axes[i].set_xlabel('Epoch')
                 axes[i].set_ylabel('Value')
-                axes[i].set_title(key.replace('_', ' ').title())
-                axes[i].grid(True)
+                axes[i].set_title(key.replace('_', ' ').title() + ' (전체 학습 기록)')
+                axes[i].grid(True, alpha=0.3)
 
         # Hide unused subplots
         for i in range(len(eval_keys), len(axes)):
@@ -216,13 +284,13 @@ class BYOLMonitor:
 
         if self.save_plots:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Evaluation metrics saved to {save_path}")
+            print(f"✅ Evaluation metrics saved to {save_path}")
 
         plt.close()
 
     def save_history(self, save_path=None):
         """
-        Save history to JSON
+        Save history to JSON (이전 + 현재 데이터 통합)
 
         Args:
             save_path: path to save history
@@ -230,22 +298,11 @@ class BYOLMonitor:
         if save_path is None:
             save_path = os.path.join(self.log_dir, 'history.json')
 
-        # Convert to serializable format
-        history_dict = {}
-        for key, value in self.history.items():
-            if isinstance(value, list):
-                # Convert numpy/torch values to native Python
-                history_dict[key] = [
-                    float(v) if isinstance(v, (np.floating, torch.Tensor)) else v
-                    for v in value
-                ]
-            else:
-                history_dict[key] = value
-
+        # ✅ NumpyEncoder로 자동 변환
         with open(save_path, 'w') as f:
-            json.dump(history_dict, f, indent=2)
+            json.dump(dict(self.history), f, indent=2, cls=NumpyEncoder)
 
-        print(f"History saved to {save_path}")
+        print(f"✅ History saved to {save_path} ({len(self.history['epoch'])} epochs)")
 
     def load_history(self, load_path=None):
         """
@@ -262,14 +319,14 @@ class BYOLMonitor:
 
         self.history = defaultdict(list, history_dict)
 
-        print(f"History loaded from {load_path}")
+        print(f"✅ History loaded from {load_path} ({len(self.history['epoch'])} epochs)")
 
     def print_summary(self):
         """
-        Print training summary
+        Print training summary (전체 학습 기록)
         """
         print("\n" + "="*60)
-        print("TRAINING SUMMARY")
+        print("TRAINING SUMMARY (전체 학습 기록)")
         print("="*60)
 
         if len(self.history['epoch']) > 0:
@@ -277,7 +334,9 @@ class BYOLMonitor:
             best_train_loss = min(self.history['train_loss'])
             best_val_loss = min(self.history['val_loss'])
 
-            print(f"\nTotal Epochs:        {last_epoch + 1}")
+            print(f"\nTotal Epochs:        {int(last_epoch) + 1}")
+            print(f"First Epoch:         {int(self.history['epoch'][0])}")
+            print(f"Last Epoch:          {int(last_epoch)}")
             print(f"Best Train Loss:     {best_train_loss:.6f}")
             print(f"Best Val Loss:       {best_val_loss:.6f}")
 
@@ -299,6 +358,26 @@ class BYOLMonitor:
             True if should evaluate
         """
         return (epoch + 1) % self.eval_frequency == 0
+
+    def get_stats(self):
+        """
+        Get training statistics
+        
+        Returns:
+            dict with summary stats
+        """
+        if len(self.history['epoch']) == 0:
+            return {}
+        
+        return {
+            'total_epochs': len(self.history['epoch']),
+            'first_epoch': int(self.history['epoch'][0]),
+            'last_epoch': int(self.history['epoch'][-1]),
+            'best_train_loss': float(min(self.history['train_loss'])),
+            'best_val_loss': float(min(self.history['val_loss'])),
+            'final_train_loss': float(self.history['train_loss'][-1]),
+            'final_val_loss': float(self.history['val_loss'][-1]),
+        }
 
 
 def visualize_latent_space(features, labels=None, method='tsne', save_path=None, title='Latent Space'):
@@ -371,19 +450,23 @@ def visualize_latent_space(features, labels=None, method='tsne', save_path=None,
 
     if save_path is not None:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Latent space visualization saved to {save_path}")
+        print(f"✅ Latent space visualization saved to {save_path}")
 
     plt.close()
 
 
 def test_monitor():
-    """Test monitoring system"""
-    print("Testing BYOL monitor...")
+    """Test monitoring system with resume"""
+    print("Testing BYOL monitor with resume support...")
 
-    monitor = BYOLMonitor(log_dir='test_logs', eval_frequency=5)
+    # First training (10 epochs)
+    print("\n" + "="*60)
+    print("Phase 1: Initial training (10 epochs)")
+    print("="*60)
+    
+    monitor = BYOLMonitor(log_dir='test_logs', eval_frequency=5, resume=False)
 
-    # Simulate training
-    for epoch in range(20):
+    for epoch in range(10):
         train_loss = 2.0 - epoch * 0.05 + np.random.randn() * 0.1
         val_loss = 2.1 - epoch * 0.04 + np.random.randn() * 0.1
         lr = 0.001 * (0.9 ** (epoch // 5))
@@ -391,18 +474,43 @@ def test_monitor():
 
         monitor.log_epoch(epoch, train_loss, val_loss, lr, tau)
 
-        # Collapse detection
         feat_std = 1.0 - epoch * 0.03
         avg_cos_sim = 0.1 + epoch * 0.02
         is_collapsed = feat_std < 0.3
         monitor.log_collapse_detection(epoch, feat_std, avg_cos_sim, is_collapsed)
 
-    # Plot
     monitor.plot_training_curves()
     monitor.save_history()
-    monitor.print_summary()
 
-    print("\nMonitor test passed!")
+    # Resume training (10 more epochs)
+    print("\n" + "="*60)
+    print("Phase 2: Resume training (10 more epochs)")
+    print("="*60)
+    
+    monitor_resumed = BYOLMonitor(log_dir='test_logs', eval_frequency=5, resume=True)
+    # ✅ 자동으로 이전 10 epochs 로드됨!
+
+    for epoch in range(10, 20):
+        train_loss = 1.0 - (epoch-10) * 0.03 + np.random.randn() * 0.05
+        val_loss = 1.1 - (epoch-10) * 0.025 + np.random.randn() * 0.05
+        lr = 0.0005 * (0.9 ** ((epoch-10) // 5))
+        tau = 0.997 + (epoch-10) * 0.0001
+
+        monitor_resumed.log_epoch(epoch, train_loss, val_loss, lr, tau)
+
+        feat_std = 0.7 - (epoch-10) * 0.02
+        avg_cos_sim = 0.3 + (epoch-10) * 0.01
+        is_collapsed = feat_std < 0.3
+        monitor_resumed.log_collapse_detection(epoch, feat_std, avg_cos_sim, is_collapsed)
+
+    monitor_resumed.plot_training_curves()
+    monitor_resumed.save_history()
+    monitor_resumed.print_summary()
+
+    print("\n✅ Monitor test passed!")
+    print(f"📊 Total epochs in history: {len(monitor_resumed.history['epoch'])}")
+    print(f"   First epoch: {int(monitor_resumed.history['epoch'][0])}")
+    print(f"   Last epoch: {int(monitor_resumed.history['epoch'][-1])}")
 
 
 if __name__ == "__main__":

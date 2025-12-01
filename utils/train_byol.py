@@ -188,7 +188,7 @@ def extract_features(model, dataloader, device, use_target=True, verbose=True):
                 if len(data) == 4:
                     # From dataloader_utils: (images, images_aug, labels, indices)
                     images = data[0]
-                    labels = data[2]  # Use actual labels
+                    labels = data[2]  # labels는 list!
                 elif len(data) > 1:
                     images = data[0]
                     labels = data[1]
@@ -205,8 +205,26 @@ def extract_features(model, dataloader, device, use_target=True, verbose=True):
             features = model.get_embeddings(images, use_target=use_target)
 
             all_features.append(features.cpu())
+            
+            # ✅ 수정: labels를 올바르게 처리
             if labels is not None:
-                all_labels.append(labels)
+                # labels가 list라면 tensor로 변환 필요
+                if isinstance(labels, list):
+                    # 숫자로 변환 가능하면 tensor로
+                    try:
+                        labels_tensor = torch.tensor(labels, dtype=torch.long)
+                        all_labels.append(labels_tensor)
+                    except (ValueError, TypeError):
+                        # 문자열 라벨이면 그냥 list로 유지
+                        all_labels.extend(labels)
+                elif isinstance(labels, torch.Tensor):
+                    all_labels.append(labels.cpu())
+                else:
+                    # 다른 형식이면 list로 추가
+                    if isinstance(labels, (list, tuple)):
+                        all_labels.extend(labels)
+                    else:
+                        all_labels.append(labels)
 
             # Print progress
             if verbose and (batch_idx % 10 == 0 or batch_idx == total_batches_count - 1):
@@ -215,9 +233,15 @@ def extract_features(model, dataloader, device, use_target=True, verbose=True):
     # Concatenate all features
     all_features = torch.cat(all_features, dim=0)
 
+    # ✅ 수정: labels 처리
     if len(all_labels) > 0:
-        all_labels = torch.cat(all_labels, dim=0)
-        return all_features, all_labels
+        # 첫 번째 원소가 tensor인지 list인지 확인
+        if isinstance(all_labels[0], torch.Tensor):
+            all_labels = torch.cat(all_labels, dim=0)
+            return all_features, all_labels
+        else:
+            # list of strings/mixed types
+            return all_features, all_labels
     else:
         return all_features, None
 
@@ -387,17 +411,13 @@ def log_training_info(epoch, train_loss, val_loss, learning_rate, tau, elapsed_t
     print(f"\n{'='*60}")
     print(f"Epoch {epoch+1} Summary")
     print(f"{'='*60}")
-    print(f"Train Loss:      {train_loss:.6f}")
-    print(f"Val Loss:        {val_loss:.6f}")
-    print(f"Learning Rate:   {learning_rate:.6e}")
-    print(f"Tau (EMA):       {tau:.6f}")
-    print(f"Time:            {elapsed_time:.2f}s")
+    print(f"Train Loss: {train_loss:.6f} / Val Loss: {val_loss:.6f}")
+    print(f"Learning Rate: {learning_rate:.6e} / Tau (EMA): {tau:.6f}")
+    print(f"Time: {elapsed_time:.2f}s")
 
     if collapse_info is not None:
         print(f"\nCollapse Detection:")
-        print(f"  Feature Std:   {collapse_info['feat_std']:.6f}")
-        print(f"  Avg Cos Sim:   {collapse_info['avg_cos_sim']:.6f}")
-        print(f"  Collapsed:     {collapse_info['is_collapsed']}")
+        print(f"  Feature Std: {collapse_info['feat_std']:.6f} / Avg Cos Sim: {collapse_info['avg_cos_sim']:.6f} / Collapsed: {collapse_info['is_collapsed']}")
 
     print(f"{'='*60}\n")
 

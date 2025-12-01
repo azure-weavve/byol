@@ -17,6 +17,7 @@ import time
 import math
 from datetime import datetime
 import numpy as np
+import json
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -127,10 +128,6 @@ def train_byol_wafer(config):
     """
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
     # Create output directories
     os.makedirs(config['save_dir'], exist_ok=True)
@@ -209,11 +206,15 @@ def train_byol_wafer(config):
     print("Setting up augmentation...")
     augmentation = get_byol_augmentation(config['augmentation_type'])
 
+    # ✅ 수정: resume 파라미터 전달
+    resume_training = config.get('resume_path') is not None and os.path.exists(config.get('resume_path', ''))
+
     # Monitor
     monitor = BYOLMonitor(
         log_dir=config['log_dir'],
         eval_frequency=config['eval_frequency'],
-        save_plots=True
+        save_plots=True,
+        resume=resume_training  # ✅ 자동으로 이전 history 로드
     )
 
     # Early stopping
@@ -245,12 +246,12 @@ def train_byol_wafer(config):
         # Train
         train_loss = train_byol_epoch(
             model, train_loader, optimizer, device,
-            tau=tau, augmentation=augmentation, epoch=epoch, verbose=True
+            tau=tau, augmentation=augmentation, epoch=epoch, verbose=False
         )
 
         # Validate
         val_loss = validate_byol_epoch(
-            model, val_loader, device, augmentation, verbose=True
+            model, val_loader, device, augmentation, verbose=False
         )
 
         # Update scheduler
@@ -288,7 +289,7 @@ def train_byol_wafer(config):
         if monitor.should_evaluate(epoch):
             print(f"\nPerforming evaluation at epoch {epoch+1}...")
             eval_metrics, cluster_labels = evaluate_all(
-                model, val_loader, device, n_samples_invariance=100
+                model, val_loader, device, n_samples_invariance=100, log_dir=config['log_dir']
             )
             print_evaluation_results(eval_metrics)
 
@@ -339,7 +340,7 @@ def train_byol_wafer(config):
     print("="*60)
 
     eval_metrics, cluster_labels = evaluate_all(
-        model, val_loader, device, n_samples_invariance=200
+        model, val_loader, device, n_samples_invariance=200, log_dir=config['log_dir']
     )
     print_evaluation_results(eval_metrics)
 
@@ -434,19 +435,6 @@ def get_default_config(path):
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description='Train BYOL for wafer pattern clustering')
-    parser.add_argument('--config', type=str, default=None, help='Path to config file')
-    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--data_path', type=str, default=None, help='Path to wafer data (.npz file)')
-    parser.add_argument('--data_name', type=str, default='wafer_data', help='Name for the data')
-    parser.add_argument('--epochs', type=int, default=None, help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=None, help='Batch size')
-    parser.add_argument('--lr', type=float, default=None, help='Learning rate')
-    parser.add_argument('--use_filter', action='store_true', help='Use wafer map filtering')
-    parser.add_argument('--use_density_aware', action='store_true', help='Use density-aware filtering')
-
-    args = parser.parse_args()
-
     path = '/mnt/kh0213.jang/Documents/wm811k'
     base_path = path + "/clustering/pth_file"
     today = datetime.today()
@@ -454,30 +442,6 @@ def main():
 
     # Get default config
     config = get_default_config(path=path)
-
-    # Override with command line arguments
-    if args.resume is not None:
-        config['resume_path'] = args.resume
-    if args.data_path is not None:
-        config['data_configs'] = [{"path": args.data_path, "name": args.data_name}]
-    if args.epochs is not None:
-        config['epochs'] = args.epochs
-    if args.batch_size is not None:
-        config['batch_size'] = args.batch_size
-    if args.lr is not None:
-        config['base_lr'] = args.lr
-    if args.use_filter:
-        config['use_filter'] = True
-    if args.use_density_aware:
-        config['use_density_aware'] = True
-
-    # Print configuration
-    print("\n" + "="*60)
-    print("BYOL TRAINING CONFIGURATION")
-    print("="*60)
-    for key, value in config.items():
-        print(f"{key:30s}: {value}")
-    print("="*60 + "\n")
 
     # Start training
     train_byol_wafer(config)

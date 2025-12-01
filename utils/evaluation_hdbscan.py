@@ -9,13 +9,16 @@ Metrics:
 PyTorch 1.4.0 compatible
 """
 
-import os
 import torch
 import numpy as np
-import pandas as pd
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 from sklearn.cluster import DBSCAN
-
+try:
+    import hdbscan
+    HDBSCAN_AVAILABLE = True
+except ImportError:
+    HDBSCAN_AVAILABLE = False
+    print("Warning: hdbscan not available. Using DBSCAN instead.")
 
 
 def compute_pairwise_distances(features, metric='euclidean'):
@@ -134,108 +137,45 @@ def evaluate_retrieval(features, k=5, metric='euclidean', ground_truth_func=None
     return metrics
 
 
-def estimate_optimal_eps(features, min_samples=10, method='elbow'):
+def evaluate_clustering(features, min_cluster_size=50, min_samples=10, use_hdbscan=True):
     """
-    K-distance graph 기반 최적 eps 추정
-    당신의 latent space에 맞춤형
-    
+    Evaluate clustering quality
+
     Args:
-        features: (N, D) embeddings
-        min_samples: DBSCAN min_samples
-        method: 'elbow' or 'percentile'
-    
+        features: (N, D) feature tensor or numpy array
+        min_cluster_size: minimum cluster size for HDBSCAN
+        min_samples: minimum samples for HDBSCAN
+        use_hdbscan: use HDBSCAN if available, else DBSCAN
+
     Returns:
-        eps: 추정된 eps 값
-    """
-    from sklearn.neighbors import NearestNeighbors
-    import numpy as np
-    
-    # K-distance graph 생성
-    neighbors = NearestNeighbors(n_neighbors=min_samples)
-    neighbors_fit = neighbors.fit(features)
-    distances, indices = neighbors_fit.kneighbors(features)
-    
-    # min_samples번째 거리 추출 및 정렬
-    k_distances = np.sort(distances[:, min_samples-1], axis=0)
-    
-    if method == 'elbow':
-        # Elbow point 찾기 (2차 미분)
-        second_derivative = np.diff(k_distances, n=2)
-        elbow_idx = np.argmax(second_derivative)
-        eps = k_distances[elbow_idx]
-        
-    elif method == 'percentile':
-        # Percentile 기반 (더 보수적, 권장)
-        # 90 percentile = 대부분의 점을 포함하되 sparse 제거
-        eps = np.percentile(k_distances, 70)
-    
-    return eps, k_distances
-
-
-def visualize_k_distance_graph(features, min_samples=10, save_path=None):
-    """
-    K-distance graph 시각화 (eps 선택 도움)
-    """
-    import matplotlib.pyplot as plt
-    
-    eps, k_distances = estimate_optimal_eps(features, min_samples, method='elbow')
-    
-    fig, ax = plt.subplots(figsize=(12, 5))
-    
-    ax.plot(k_distances, linewidth=1)
-    ax.axhline(y=eps, color='r', linestyle='--', label=f'Estimated eps={eps:.4f}')
-    ax.set_xlabel('Data Points (sorted)')
-    ax.set_ylabel('K-distance')
-    ax.set_title('K-distance Graph for DBSCAN eps Selection')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"K-distance graph saved to {save_path}")
-    
-    plt.close()
-    
-    return eps
-
-
-def evaluate_clustering(features, min_cluster_size=50, min_samples=10):
-    """
-    DBSCAN with optimal eps estimation
-    
-    Args:
-        features: (N, D) embeddings
-        min_cluster_size: minimum cluster size (HDBSCAN 호환)
-        min_samples: DBSCAN min_samples
-        use_hdbscan: HDBSCAN 사용 시도 (설치 안 되면 자동으로 DBSCAN)
-    
-    Returns:
-        metrics: dict
+        metrics: dict with clustering metrics
         labels: cluster labels
     """
-    
-    # Convert to numpy
+    # Convert to numpy if tensor
     if isinstance(features, torch.Tensor):
         features = features.cpu().numpy()
 
-    # Try HDBSCAN first
-    # DBSCAN: optimal eps 동적 추정
-    print(f"🔧 Using DBSCAN (hdbscan not available)")
-    eps, _ = estimate_optimal_eps(features, min_samples, method='percentile')
-    print(f"   Estimated eps={eps:.4f}")
-    
-    clusterer = DBSCAN(eps=eps, min_samples=min_samples)
-    labels = clusterer.fit_predict(features)
+    # Perform clustering
+    if use_hdbscan and HDBSCAN_AVAILABLE:
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric='euclidean'
+        )
+        labels = clusterer.fit_predict(features)
+    else:
+        # Fallback to DBSCAN
+        clusterer = DBSCAN(eps=0.5, min_samples=min_samples)
+        labels = clusterer.fit_predict(features)
 
-    # Filter noise points
+    # Filter out noise points (label -1)
     non_noise_mask = labels != -1
     n_noise = (labels == -1).sum()
     n_samples = len(labels)
     noise_ratio = n_noise / n_samples
 
-    print(f"   Clusters: {len(np.unique(labels[labels != -1]))}, Noise: {noise_ratio*100:.1f}%")
-
     if non_noise_mask.sum() < 2:
+        # Not enough samples for clustering metrics
         return {
             'n_clusters': 0,
             'noise_ratio': noise_ratio,
@@ -251,7 +191,7 @@ def evaluate_clustering(features, min_cluster_size=50, min_samples=10):
     # Number of clusters
     n_clusters = len(np.unique(clustered_labels))
 
-    # Compute metrics
+    # Compute metrics (only for non-noise points)
     if n_clusters > 1:
         silhouette = silhouette_score(clustered_features, clustered_labels)
         calinski = calinski_harabasz_score(clustered_features, clustered_labels)
@@ -368,7 +308,8 @@ def evaluate_cluster_consistency_d4(model, test_samples, device, min_cluster_siz
     # Cluster
     _, cluster_labels = evaluate_clustering(
         all_embeddings,
-        min_cluster_size=min_cluster_size
+        min_cluster_size=min_cluster_size,
+        use_hdbscan=True
     )
 
     # Check consistency: how many D4 groups are in the same cluster?
@@ -389,25 +330,26 @@ def evaluate_cluster_consistency_d4(model, test_samples, device, min_cluster_siz
     return consistency_ratio
 
 
-def evaluate_all(model, dataloader, device, n_samples_invariance=100, log_dir='logs'):
+def evaluate_all(model, dataloader, device, n_samples_invariance=100):
     """
-    Comprehensive evaluation with DBSCAN optimization
+    Comprehensive evaluation
+
+    Args:
+        model: BYOL model
+        dataloader: data loader
+        device: torch device
+        n_samples_invariance: number of samples for rotation invariance test
+
+    Returns:
+        all_metrics: dict with all metrics
     """
     from utils.train_byol import extract_features
 
     print("Extracting features...")
-    features, _ = extract_features(model, dataloader, device, use_target=True, verbose=False)
+    features, _ = extract_features(model, dataloader, device, use_target=True)
 
     print("\nEvaluating retrieval...")
     retrieval_metrics = evaluate_retrieval(features, k=5, metric='euclidean')
-
-    # K-distance graph 시각화 (eps 선택 도움)
-    print("\nVisualizing k-distance graph...")
-    visualize_k_distance_graph(
-        features, 
-        min_samples=10,
-        save_path=os.path.join(log_dir, 'k_distance_graph.png')
-    )
 
     print("\nEvaluating clustering...")
     clustering_metrics, labels = evaluate_clustering(features, min_cluster_size=50)
@@ -440,56 +382,6 @@ def evaluate_all(model, dataloader, device, n_samples_invariance=100, log_dir='l
     }
 
     return all_metrics, labels
-
-# evaluation.py에 추가
-def find_optimal_dbscan_params(features, min_samples_list=[5, 10, 15], 
-                                percentiles=[75, 80, 85, 90, 95]):
-    """
-    여러 파라미터 조합 테스트
-    """
-    results = []
-    
-    for min_samples in min_samples_list:
-        for percentile in percentiles:
-            eps, _ = estimate_optimal_eps(features, min_samples, method='percentile')
-            # 수동으로 percentile 적용
-            from sklearn.neighbors import NearestNeighbors
-            neighbors = NearestNeighbors(n_neighbors=min_samples)
-            neighbors_fit = neighbors.fit(features)
-            distances, _ = neighbors_fit.kneighbors(features)
-            k_distances = np.sort(distances[:, min_samples-1], axis=0)
-            eps = np.percentile(k_distances, percentile)
-            
-            # 평가
-            from sklearn.cluster import DBSCAN
-            labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(features)
-            
-            n_clusters = len(np.unique(labels[labels != -1]))
-            noise_ratio = (labels == -1).sum() / len(labels)
-            
-            if n_clusters > 1 and (labels != -1).sum() > 10:
-                non_noise = labels[labels != -1]
-                clustered_features = features[labels != -1]
-                from sklearn.metrics import silhouette_score
-                silhouette = silhouette_score(clustered_features, non_noise)
-            else:
-                silhouette = None
-            
-            results.append({
-                'min_samples': min_samples,
-                'percentile': percentile,
-                'eps': eps,
-                'n_clusters': n_clusters,
-                'noise_ratio': noise_ratio,
-                'silhouette': silhouette
-            })
-    
-    return pd.DataFrame(results)
-
-# 사용 (epoch 0에 한 번만)
-# tuning_results = find_optimal_dbscan_params(features)
-# print(tuning_results.to_string())
-# 가장 좋은 조합 선택해서 파라미터 고정
 
 
 def print_evaluation_results(metrics):
