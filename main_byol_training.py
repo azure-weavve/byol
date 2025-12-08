@@ -316,7 +316,7 @@ def train_byol_wafer(config):
             print(f"Best model saved (val_loss: {val_loss:.6f})")
 
         # Regular checkpoint
-        if (epoch + 1) % config['save_frequency'] == 0:
+        if epoch == 0 or (epoch + 1) % config['save_frequency'] == 0:
             save_path = os.path.join(config['save_dir'], f'checkpoint_epoch_{epoch+1}.pth')
             save_checkpoint(
                 model, optimizer, scheduler, epoch, val_loss, save_path,
@@ -329,7 +329,7 @@ def train_byol_wafer(config):
             break
 
         # Save plots periodically
-        if (epoch + 1) % 10 == 0:
+        if epoch == 0 or (epoch + 1) % 10 == 0:
             monitor.plot_training_curves()
             monitor.plot_evaluation_metrics()
             monitor.save_history()
@@ -367,6 +367,14 @@ def train_byol_wafer(config):
         title='Final Latent Space'
     )
 
+    # ✅ 추가: 학습 요약 생성
+    print("\n" + "="*60)
+    print("Generating Training Summary...")
+    print("="*60)
+    
+    from utils.training_summary import generate_training_summary
+    generate_training_summary(log_dir=config['log_dir'], interval=10)
+    
     print("\nTraining completed!")
 
 
@@ -427,7 +435,8 @@ def get_default_config(path):
         # Paths
         'save_dir': 'checkpoints',
         'log_dir': 'logs',
-        'resume_path': None
+        #'resume_path': None
+        'resume_path': f"{path}/clustering/byol/checkpoints/final_model.pth"
     }
 
     return config

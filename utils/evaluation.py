@@ -207,60 +207,121 @@ def evaluate_clustering(features, min_cluster_size=50, min_samples=10):
         features: (N, D) embeddings
         min_cluster_size: minimum cluster size (HDBSCAN 호환)
         min_samples: DBSCAN min_samples
-        use_hdbscan: HDBSCAN 사용 시도 (설치 안 되면 자동으로 DBSCAN)
     
     Returns:
-        metrics: dict
+        metrics: dict (항상 유효한 값 반환 보장)
         labels: cluster labels
     """
+    import numpy as np
+    from sklearn.cluster import DBSCAN
+    from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+    import torch
     
     # Convert to numpy
     if isinstance(features, torch.Tensor):
         features = features.cpu().numpy()
 
-    # Try HDBSCAN first
-    # DBSCAN: optimal eps 동적 추정
-    print(f"🔧 Using DBSCAN (hdbscan not available)")
-    eps, _ = estimate_optimal_eps(features, min_samples, method='percentile')
-    print(f"   Estimated eps={eps:.4f}")
+    # ✅ k-distance 계산
+    from sklearn.neighbors import NearestNeighbors
+    neighbors = NearestNeighbors(n_neighbors=min_samples)
+    neighbors.fit(features)
+    distances, _ = neighbors.kneighbors(features)
+    k_distances = np.sort(distances[:, min_samples-1])
     
-    clusterer = DBSCAN(eps=eps, min_samples=min_samples)
-    labels = clusterer.fit_predict(features)
-
-    # Filter noise points
-    non_noise_mask = labels != -1
-    n_noise = (labels == -1).sum()
-    n_samples = len(labels)
-    noise_ratio = n_noise / n_samples
-
-    print(f"   Clusters: {len(np.unique(labels[labels != -1]))}, Noise: {noise_ratio*100:.1f}%")
-
-    if non_noise_mask.sum() < 2:
-        return {
-            'n_clusters': 0,
+    # ✅ eps 후보 생성 (더 넓은 범위)
+    percentile_candidates = [30, 40, 50, 60, 70, 80, 90]
+    eps_candidates = [np.percentile(k_distances, p) for p in percentile_candidates]
+    
+    print("\n🔍 Testing multiple eps values:")
+    print("─" * 80)
+    
+    all_results = []  # 모든 결과 저장
+    
+    for percentile, eps in zip(percentile_candidates, eps_candidates):
+        labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(features)
+        
+        n_clusters = len(np.unique(labels[labels != -1]))
+        noise_ratio = (labels == -1).sum() / len(labels)
+        non_noise_count = (labels != -1).sum()
+        
+        # Silhouette 계산 (가능한 경우)
+        sil = None
+        if n_clusters >= 2 and non_noise_count >= 10:
+            try:
+                non_noise = labels[labels != -1]
+                clustered_features = features[labels != -1]
+                sil = silhouette_score(clustered_features, non_noise)
+            except:
+                sil = None
+        
+        # Score 계산
+        if sil is not None:
+            # 목표: n_clusters 15-40, noise < 15%, silhouette > 0.5
+            score = sil - 0.1 * abs(n_clusters - 25) / 25 - 0.3 * noise_ratio
+        elif n_clusters >= 2:
+            # silhouette 없으면 클러스터 수와 noise만 고려
+            score = -abs(n_clusters - 25) / 25 - noise_ratio
+        else:
+            score = -999  # 클러스터가 1개 이하면 최악
+        
+        all_results.append({
+            'percentile': percentile,
+            'eps': eps,
+            'labels': labels,
+            'n_clusters': n_clusters,
             'noise_ratio': noise_ratio,
-            'silhouette': None,
-            'calinski_harabasz': None,
-            'davies_bouldin': None
-        }, labels
-
-    # Get clustered features and labels
-    clustered_features = features[non_noise_mask]
-    clustered_labels = labels[non_noise_mask]
-
-    # Number of clusters
-    n_clusters = len(np.unique(clustered_labels))
-
-    # Compute metrics
-    if n_clusters > 1:
-        silhouette = silhouette_score(clustered_features, clustered_labels)
-        calinski = calinski_harabasz_score(clustered_features, clustered_labels)
-        davies = davies_bouldin_score(clustered_features, clustered_labels)
+            'silhouette': sil,
+            'score': score
+        })
+        
+        # 출력
+        sil_str = f"{sil:.4f}" if sil is not None else "N/A"
+        print(f"percentile={percentile:2d}: eps={eps:.4f}, "
+              f"clusters={n_clusters:2d}, noise={noise_ratio:5.1%}, "
+              f"silhouette={sil_str}, score={score:7.4f}")
+    
+    print("─" * 80)
+    
+    # ✅ 최선의 결과 선택 (score 기준)
+    all_results.sort(key=lambda x: x['score'], reverse=True)
+    best = all_results[0]
+    
+    # ✅ 결과가 너무 안 좋으면 경고
+    if best['n_clusters'] < 2:
+        print("⚠️  WARNING: Could not find 2+ clusters!")
+        print("    This might indicate:")
+        print("    1. Model not trained enough (features too similar)")
+        print("    2. Need to adjust min_samples or eps range")
+        print("    3. Data might have very few distinct patterns")
+    
+    print(f"\n✅ Selected: eps={best['eps']:.4f}, clusters={best['n_clusters']}, "
+          f"noise={best['noise_ratio']:.1%}, silhouette={best['silhouette']}")
+    
+    labels = best['labels']
+    
+    # ✅ Metrics 계산 (항상 반환 보장)
+    non_noise_mask = labels != -1
+    n_clusters = len(np.unique(labels[non_noise_mask]))
+    noise_ratio = (labels == -1).sum() / len(labels)
+    
+    # Clustering quality metrics
+    if n_clusters >= 2 and non_noise_mask.sum() >= 10:
+        clustered_features = features[non_noise_mask]
+        clustered_labels = labels[non_noise_mask]
+        
+        try:
+            silhouette = silhouette_score(clustered_features, clustered_labels)
+            calinski = calinski_harabasz_score(clustered_features, clustered_labels)
+            davies = davies_bouldin_score(clustered_features, clustered_labels)
+        except:
+            silhouette = None
+            calinski = None
+            davies = None
     else:
         silhouette = None
         calinski = None
         davies = None
-
+    
     metrics = {
         'n_clusters': n_clusters,
         'noise_ratio': noise_ratio,

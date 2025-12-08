@@ -40,6 +40,9 @@ class TrainingSummary:
         """
         Epoch별 진행도 테이블 생성 (10 epoch마다)
         
+        ✅ 수정: evaluation metrics는 실제 평가된 epoch과 **가장 가까운** 값을 매칭
+        예: epoch 0 → epoch 9의 평가 결과 사용
+        
         Args:
             interval: 몇 epoch마다 보여줄 것인가 (기본: 10)
         
@@ -55,13 +58,39 @@ class TrainingSummary:
         feat_stds = self.history.get('feat_std', [])
         avg_cos_sims = self.history.get('avg_cos_sim', [])
         
-        # Clustering metrics (있으면)
+        # Clustering metrics (있으면) - (epoch, value) 튜플 리스트
         n_clusters = self.history.get('clustering_n_clusters', [])
         noise_ratio = self.history.get('clustering_noise_ratio', [])
         silhouette = self.history.get('clustering_silhouette', [])
         
-        # Rotation invariance (있으면)
+        # Rotation invariance (있으면) - (epoch, value) 튜플 리스트
         rotation_inv = self.history.get('rotation_invariance_avg_cosine_similarity', [])
+        
+        # 🔹 Helper function: 가장 가까운 evaluation epoch의 value 찾기
+        def find_closest_value(metric_list, target_epoch):
+            """
+            (epoch, value) 튜플 리스트에서 target_epoch에 **가장 가까운** evaluation epoch의 value 찾기
+            예: target=0, metric_list=[(9, 0.6), (19, 0.5)] → 0.6 (epoch 9가 가장 가까움)
+            """
+            if not metric_list or len(metric_list) == 0:
+                return None
+            
+            # 모든 evaluation epoch 추출
+            eval_epochs = []
+            eval_values = []
+            for item in metric_list:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    eval_epochs.append(int(item[0]))
+                    eval_values.append(item[1])
+            
+            if len(eval_epochs) == 0:
+                return None
+            
+            # 가장 가까운 evaluation epoch 찾기
+            closest_idx = min(range(len(eval_epochs)), 
+                            key=lambda i: abs(eval_epochs[i] - target_epoch))
+            
+            return eval_values[closest_idx]
         
         # Interval로 샘플링
         summary_data = []
@@ -81,39 +110,18 @@ class TrainingSummary:
                 'Avg Cos Sim': f"{avg_cos_sims[epoch_idx]:.4f}" if epoch_idx < len(avg_cos_sims) else "N/A",
             }
             
-            # Clustering metrics
-            if epoch_idx < len(silhouette) and len(silhouette) > 0:
-                # silhouette이 (epoch, value) 튜플 형태일 수 있음
-                if isinstance(silhouette[epoch_idx], (list, tuple)):
-                    row['Silhouette'] = f"{silhouette[epoch_idx][1]:.4f}"
-                else:
-                    row['Silhouette'] = f"{silhouette[epoch_idx]:.4f}"
-            else:
-                row['Silhouette'] = "N/A"
+            # 🔹 Evaluation metrics: 가장 가까운 평가 결과 매칭
+            sil_value = find_closest_value(silhouette, epoch)
+            row['Silhouette'] = f"{sil_value:.4f}" if sil_value is not None else "N/A"
             
-            if epoch_idx < len(n_clusters) and len(n_clusters) > 0:
-                if isinstance(n_clusters[epoch_idx], (list, tuple)):
-                    row['n_clusters'] = int(n_clusters[epoch_idx][1])
-                else:
-                    row['n_clusters'] = int(n_clusters[epoch_idx])
-            else:
-                row['n_clusters'] = "N/A"
+            ncl_value = find_closest_value(n_clusters, epoch)
+            row['n_clusters'] = int(ncl_value) if ncl_value is not None else "N/A"
             
-            if epoch_idx < len(noise_ratio) and len(noise_ratio) > 0:
-                if isinstance(noise_ratio[epoch_idx], (list, tuple)):
-                    row['Noise %'] = f"{noise_ratio[epoch_idx][1]*100:.1f}%"
-                else:
-                    row['Noise %'] = f"{noise_ratio[epoch_idx]*100:.1f}%"
-            else:
-                row['Noise %'] = "N/A"
+            noise_value = find_closest_value(noise_ratio, epoch)
+            row['Noise %'] = f"{noise_value*100:.1f}%" if noise_value is not None else "N/A"
             
-            if epoch_idx < len(rotation_inv) and len(rotation_inv) > 0:
-                if isinstance(rotation_inv[epoch_idx], (list, tuple)):
-                    row['Rotation Inv'] = f"{rotation_inv[epoch_idx][1]:.4f}"
-                else:
-                    row['Rotation Inv'] = f"{rotation_inv[epoch_idx]:.4f}"
-            else:
-                row['Rotation Inv'] = "N/A"
+            rot_value = find_closest_value(rotation_inv, epoch)
+            row['Rotation Inv'] = f"{rot_value:.4f}" if rot_value is not None else "N/A"
             
             summary_data.append(row)
         
@@ -130,37 +138,18 @@ class TrainingSummary:
                 'Avg Cos Sim': f"{avg_cos_sims[epoch_idx]:.4f}" if epoch_idx < len(avg_cos_sims) else "N/A",
             }
             
-            if epoch_idx < len(silhouette) and len(silhouette) > 0:
-                if isinstance(silhouette[epoch_idx], (list, tuple)):
-                    row['Silhouette'] = f"{silhouette[epoch_idx][1]:.4f}"
-                else:
-                    row['Silhouette'] = f"{silhouette[epoch_idx]:.4f}"
-            else:
-                row['Silhouette'] = "N/A"
+            # 🔹 Evaluation metrics: 가장 가까운 평가 결과 매칭
+            sil_value = find_closest_value(silhouette, epoch)
+            row['Silhouette'] = f"{sil_value:.4f}" if sil_value is not None else "N/A"
             
-            if epoch_idx < len(n_clusters) and len(n_clusters) > 0:
-                if isinstance(n_clusters[epoch_idx], (list, tuple)):
-                    row['n_clusters'] = int(n_clusters[epoch_idx][1])
-                else:
-                    row['n_clusters'] = int(n_clusters[epoch_idx])
-            else:
-                row['n_clusters'] = "N/A"
+            ncl_value = find_closest_value(n_clusters, epoch)
+            row['n_clusters'] = int(ncl_value) if ncl_value is not None else "N/A"
             
-            if epoch_idx < len(noise_ratio) and len(noise_ratio) > 0:
-                if isinstance(noise_ratio[epoch_idx], (list, tuple)):
-                    row['Noise %'] = f"{noise_ratio[epoch_idx][1]*100:.1f}%"
-                else:
-                    row['Noise %'] = f"{noise_ratio[epoch_idx]*100:.1f}%"
-            else:
-                row['Noise %'] = "N/A"
+            noise_value = find_closest_value(noise_ratio, epoch)
+            row['Noise %'] = f"{noise_value*100:.1f}%" if noise_value is not None else "N/A"
             
-            if epoch_idx < len(rotation_inv) and len(rotation_inv) > 0:
-                if isinstance(rotation_inv[epoch_idx], (list, tuple)):
-                    row['Rotation Inv'] = f"{rotation_inv[epoch_idx][1]:.4f}"
-                else:
-                    row['Rotation Inv'] = f"{rotation_inv[epoch_idx]:.4f}"
-            else:
-                row['Rotation Inv'] = "N/A"
+            rot_value = find_closest_value(rotation_inv, epoch)
+            row['Rotation Inv'] = f"{rot_value:.4f}" if rot_value is not None else "N/A"
             
             summary_data.append(row)
         
@@ -193,6 +182,26 @@ class TrainingSummary:
         avg_cos_sims = self.history.get('avg_cos_sim', [])
         silhouette = self.history.get('clustering_silhouette', [])
         
+        # 🔹 Helper function: 가장 가까운 evaluation epoch 찾기
+        def find_closest_value(metric_list, target_epoch):
+            if not metric_list or len(metric_list) == 0:
+                return None
+            
+            eval_epochs = []
+            eval_values = []
+            for item in metric_list:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    eval_epochs.append(int(item[0]))
+                    eval_values.append(item[1])
+            
+            if len(eval_epochs) == 0:
+                return None
+            
+            closest_idx = min(range(len(eval_epochs)), 
+                            key=lambda i: abs(eval_epochs[i] - target_epoch))
+            
+            return eval_values[closest_idx]
+        
         best_info = {
             'Best Epoch': int(best_epoch),
             'Train Loss': f"{train_losses[best_idx]:.4f}" if best_idx < len(train_losses) else "N/A",
@@ -201,13 +210,9 @@ class TrainingSummary:
             'Avg Cos Sim': f"{avg_cos_sims[best_idx]:.4f}" if best_idx < len(avg_cos_sims) else "N/A",
         }
         
-        if best_idx < len(silhouette) and len(silhouette) > 0:
-            if isinstance(silhouette[best_idx], (list, tuple)):
-                best_info['Silhouette'] = f"{silhouette[best_idx][1]:.4f}"
-            else:
-                best_info['Silhouette'] = f"{silhouette[best_idx]:.4f}"
-        else:
-            best_info['Silhouette'] = "N/A"
+        # 🔹 Silhouette: 가장 가까운 평가 결과
+        sil_value = find_closest_value(silhouette, best_epoch)
+        best_info['Silhouette'] = f"{sil_value:.4f}" if sil_value is not None else "N/A"
         
         return best_info
     
@@ -251,23 +256,42 @@ class TrainingSummary:
         feat_stds = self.history.get('feat_std', [])
         silhouette = self.history.get('clustering_silhouette', [])
         
+        # 🔹 Helper function: 가장 가까운 evaluation epoch 찾기
+        def find_closest_value(metric_list, target_epoch):
+            if not metric_list or len(metric_list) == 0:
+                return None
+            
+            eval_epochs = []
+            eval_values = []
+            for item in metric_list:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    eval_epochs.append(int(item[0]))
+                    eval_values.append(item[1])
+            
+            if len(eval_epochs) == 0:
+                return None
+            
+            closest_idx = min(range(len(eval_epochs)), 
+                            key=lambda i: abs(eval_epochs[i] - target_epoch))
+            
+            return eval_values[closest_idx]
+        
         if len(epochs) > 0:
             final_idx = len(epochs) - 1
-            print(f"Total Epochs          : {int(epochs[final_idx]) + 1}")
+            final_epoch = epochs[final_idx]
+            
+            print(f"Total Epochs          : {int(final_epoch) + 1}")
             print(f"Final Train Loss      : {train_losses[final_idx]:.4f}")
             print(f"Final Val Loss        : {val_losses[final_idx]:.4f}")
             print(f"Feature Std           : {feat_stds[final_idx]:.4f}")
             
-            if len(silhouette) > 0:
-                if isinstance(silhouette[final_idx], (list, tuple)):
-                    sil_score = silhouette[final_idx][1]
-                else:
-                    sil_score = silhouette[final_idx]
-                
-                print(f"Silhouette Score      : {sil_score:.4f}", end="")
-                if sil_score >= 0.5:
+            # 🔹 Silhouette: 가장 가까운 평가 결과
+            sil_value = find_closest_value(silhouette, final_epoch)
+            if sil_value is not None:
+                print(f"Silhouette Score      : {sil_value:.4f}", end="")
+                if sil_value >= 0.5:
                     print(" ✅ (목표 달성!)")
-                elif sil_score >= 0.3:
+                elif sil_value >= 0.3:
                     print(" ⭐ (양호)")
                 else:
                     print(" ⚠️  (개선 필요)")

@@ -21,6 +21,8 @@ from collections import defaultdict
 import json
 import os
 
+import matplotlib.font_manager as fm
+plt.rcParams['font.family'] = 'NanumGothic'
 
 # Custom JSON Encoder
 class NumpyEncoder(json.JSONEncoder):
@@ -401,7 +403,7 @@ def visualize_latent_space(features, labels=None, method='tsne', save_path=None,
     # Dimensionality reduction
     if method == 'tsne':
         from sklearn.manifold import TSNE
-        reducer = TSNE(n_components=2, random_state=42)
+        reducer = TSNE(n_components=2, random_state=42, init='pca', learning_rate='auto')
         features_2d = reducer.fit_transform(features)
 
     elif method == 'umap':
@@ -412,7 +414,7 @@ def visualize_latent_space(features, labels=None, method='tsne', save_path=None,
         except ImportError:
             print("UMAP not available, falling back to t-SNE")
             from sklearn.manifold import TSNE
-            reducer = TSNE(n_components=2, random_state=42)
+            reducer = TSNE(n_components=2, random_state=42, init='pca', learning_rate='auto')
             features_2d = reducer.fit_transform(features)
 
     else:
