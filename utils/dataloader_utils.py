@@ -106,6 +106,7 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None, use_de
                         
                         if use_density_aware:
                             # 밀도 기반 적응형 필터링
+                            clean_wm_org = clean_wm.copy()
                             clean_wm, info = filter_obj.filter_single_map(clean_wm)
                             filtered_defects = clean_wm.sum()
                             if info['strategy'] == "very_low" and use_region_aware:
@@ -118,9 +119,11 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None, use_de
                             filtered_defects = clean_wm.sum()
                             info = None
                         
-                        # 너무 많이 제거되면 스킵 (패턴이 거의 사라짐)
+                        # 너무 많이 제거되면 스킵 (패턴이 거의 사라짐) -> 이게 진짜 필요할까?
                         if filtered_defects < original_defects * 0.2:
-                            continue
+                            clean_wm = clean_wm_org.copy()
+                            label = label + "_filter"
+                            # continue
                         
                         if filtered_defects < original_defects:
                             filtered_count += 1
@@ -421,15 +424,17 @@ def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128)
     if use_filter:
         if use_density_aware:
             mode = "Density-Aware (밀도 기반 적응형)"
-        else:
-            mode = "On-the-fly" if filter_on_the_fly else "Pre-filtering"
-        print(f"   필터링 모드: {mode}")
+        elif filter_on_the_fly:
+            mode = "On-the-fly"
+    else:
+        mode = "Pre-filtering"
+    print(f"   필터링 모드: {mode}")
 
     # 🔹 train/valid 분할을 먼저 수행
     train_indices, valid_indices = train_test_split(
         range(len(wafer_maps)), test_size=test_size, random_state=42
     )
-    
+    print(len(train_indices), len(valid_indices))
     # 🔹 분할된 데이터로 train/valid 데이터 생성
     train_maps = [wafer_maps[i] for i in train_indices]
     train_labels = [labels[i] for i in train_indices]
@@ -461,7 +466,7 @@ def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128)
     )
 
     print(f"   Train: {len(train_dataset)}개 (Augmentation: {use_augmentation})")
-    print(f"   Valid: {len(valid_dataset)}개 (Augmentation: False)")
+    print(f"   Valid: {len(valid_dataset)}개 (Augmentation: False Fixed)")
 
     # DataLoader 생성
     train_loader = DataLoader(
