@@ -103,10 +103,9 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None, use_de
                     # 🔹 필터링 적용
                     if use_filter and clean_wm.sum() > 0:
                         original_defects = clean_wm.sum()
-                        
+                        clean_wm_org = clean_wm.copy()
                         if use_density_aware:
                             # 밀도 기반 적응형 필터링
-                            clean_wm_org = clean_wm.copy()
                             clean_wm, info = filter_obj.filter_single_map(clean_wm)
                             filtered_defects = clean_wm.sum()
                             if info['strategy'] == "very_low" and use_region_aware:
@@ -122,7 +121,7 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None, use_de
                         # 너무 많이 제거되면 스킵 (패턴이 거의 사라짐) -> 이게 진짜 필요할까?
                         if filtered_defects < original_defects * 0.2:
                             clean_wm = clean_wm_org.copy()
-                            label = label + "_filter"
+                            #label = label + "_filter"
                             # continue
                         
                         if filtered_defects < original_defects:
@@ -298,11 +297,8 @@ def collate_fn(batch):
 
     for data, data_aug, label, original_idx in batch:  # 🔴 4개 받기
         try:
-            if (isinstance(data, torch.Tensor) and
-                data.dtype == torch.float32 and
-                len(data.shape) == 3 and
-                data.sum() > 0):  # 빈 맵 제거:
-
+            #if (isinstance(data, torch.Tensor) and data.dtype == torch.float32 and len(data.shape) == 3 and data.sum() > 0):  # 빈 맵 제거:
+            if (isinstance(data, torch.Tensor) and data.dtype == torch.float32 and len(data.shape) == 3):
                 safe_data.append(data)
                 safe_data_aug.append(data_aug)  # None이거나 tensor
                 safe_labels.append(label)
@@ -330,89 +326,6 @@ def collate_fn(batch):
     return batch_data, batch_data_aug, safe_labels, safe_indices  # 🔴 4개 반환
 
 
-# def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128), test_size=0.2, use_filter=True, filter_on_the_fly=False,
-#                         filter_params=None, use_density_aware=False, is_training=False, use_augmentation=False):
-#     """
-#     필터링 기능이 추가된 안전한 DataLoader들 생성
-    
-#     Args:
-#         wafer_maps: 웨이퍼맵 리스트
-#         labels: 라벨 리스트
-#         batch_size: 배치 크기
-#         target_size: 리사이즈 타겟 크기
-#         test_size: validation 비율
-#         use_filter: 필터링 사용 여부
-#         filter_on_the_fly: True면 런타임 필터링, False면 사전 필터링
-#         filter_params: 필터 파라미터
-#         use_density_aware: True면 밀도 기반 적응형 필터 사용 (권장!)
-    
-#     Returns:
-#         train_loader, valid_loader
-#     """
-
-#     print("\n🔧 안전한 DataLoader 생성")
-#     print("="*40)
-
-#     if use_filter:
-#         if use_density_aware:
-#             mode = "Density-Aware (밀도 기반 적응형)"
-#         else:
-#             mode = "On-the-fly" if filter_on_the_fly else "Pre-filtering"
-#         print(f"   필터링 모드: {mode}")
-#     # Dataset 생성
-#     dataset = MultiSizeWaferDataset(
-#         wafer_maps, labels, 
-#         target_size=target_size,
-#         use_filter=use_filter,
-#         filter_on_the_fly=filter_on_the_fly,
-#         filter_params=filter_params,
-#         use_density_aware=use_density_aware,
-#         is_training=False,  # 기본값
-#         use_augmentation=False
-#     )
-
-#     # train/valid 분할
-#     train_indices, valid_indices = train_test_split(
-#         range(len(dataset)), test_size=test_size, random_state=42
-#     )
-
-#     # Train dataset with augmentation
-#     # 🔴 Train dataset에만 augmentation 활성화
-#     train_dataset = torch.utils.data.Subset(dataset, train_indices)
-#     train_dataset.dataset.is_training = True
-#     train_dataset.dataset.use_augmentation = use_augmentation
-    
-#     # Valid dataset without augmentation
-#     valid_dataset = torch.utils.data.Subset(dataset, valid_indices)
-#     valid_dataset.dataset.is_training = False
-#     valid_dataset.dataset.use_augmentation = False
-
-#     print(f"   Train: {len(train_dataset)}개 / Valid: {len(valid_dataset)}개")
-
-#     # DataLoader 생성
-#     train_loader = DataLoader(
-#         train_dataset,
-#         batch_size=batch_size,
-#         shuffle=True,
-#         collate_fn=collate_fn,
-#         num_workers=0,
-#         pin_memory=False,
-#         drop_last=False
-#     )
-
-#     valid_loader = DataLoader(
-#         valid_dataset,
-#         batch_size=batch_size,
-#         shuffle=False,
-#         collate_fn=collate_fn,
-#         num_workers=0,
-#         pin_memory=False,
-#         drop_last=False
-#     )
-
-#     print(f"   Train 배치: {len(train_loader)}개 / Valid 배치: {len(valid_loader)}개")
-
-#     return train_loader, valid_loader
 
 def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128), test_size=0.2, 
                         use_filter=True, filter_on_the_fly=False, filter_params=None, 
@@ -434,7 +347,7 @@ def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128)
     train_indices, valid_indices = train_test_split(
         range(len(wafer_maps)), test_size=test_size, random_state=42
     )
-    print(len(train_indices), len(valid_indices))
+    
     # 🔹 분할된 데이터로 train/valid 데이터 생성
     train_maps = [wafer_maps[i] for i in train_indices]
     train_labels = [labels[i] for i in train_indices]
