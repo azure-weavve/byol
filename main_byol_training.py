@@ -168,6 +168,7 @@ def train_byol_wafer(config):
     # Create model
     print("\nCreating BYOL model...")
     model = BYOL(
+        input_channels=config['input_channels'],
         encoder_dim=config['encoder_dim'],
         projector_hidden=config['projector_hidden'],
         projector_out=config['projector_out'],
@@ -386,7 +387,8 @@ def get_default_config(path):
             {"path": f"{path}/dataset/extract_data/dataset/root/root_map_data_goodbinmap.npz", "name": "Root"},
             {"path": f"{path}/dataset/extract_data/dataset/rose/rose_map_data_goodbinmap.npz", "name": "Rose"},
             {"path": f"{path}/dataset/extract_data/dataset/santa/santa_map_data_goodbinmap.npz", "name": "Santa"},
-            {"path": f"{path}/dataset/extract_data/dataset/zuma_pro/zuma_pro_map_data_goodbinmap.npz", "name": "Zuma_pro"}
+            {"path": f"{path}/dataset/extract_data/dataset/zuma_pro/zuma_pro_map_data_goodbinmap.npz", "name": "Zuma_pro"},
+            {"path": f"{path}/dataset/extract_data/dataset/thetis/thetis_map_data_goodbinmap.npz", "name": "Thetis"}
         ],
         'use_filter': True,
         'use_density_aware': False,
@@ -404,6 +406,7 @@ def get_default_config(path):
         'predictor_hidden': 1024,
         'use_radial_encoding': True,
         'use_attention': True,
+        'input_channels':10, # 0을 제외한 1부터 채널 수 입력 필요
 
         # Training
         'epochs': 100,

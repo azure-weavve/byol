@@ -43,7 +43,8 @@ class BYOL(nn.Module):
                  use_radial_encoding=True,
                  use_attention=True,
                  wafer_size=(128, 128),
-                 tau=0.996):
+                 tau=0.996,
+                 input_channels=10):
         super(BYOL, self).__init__()
 
         self.encoder_dim = encoder_dim
@@ -52,7 +53,7 @@ class BYOL(nn.Module):
 
         # === Online Network (trainable) ===
         self.encoder_online = WaferEncoder(
-            input_channels=1,
+            input_channels=input_channels,
             output_dim=encoder_dim,
             use_radial_encoding=use_radial_encoding,
             use_attention=use_attention,
@@ -73,7 +74,7 @@ class BYOL(nn.Module):
 
         # === Target Network (EMA, no grad) ===
         self.encoder_target = WaferEncoder(
-            input_channels=1,
+            input_channels=input_channels,
             output_dim=encoder_dim,
             use_radial_encoding=use_radial_encoding,
             use_attention=use_attention,
