@@ -146,6 +146,21 @@ def train_byol_wafer(config):
 
     if wafer_maps is None or len(wafer_maps) == 0:
         raise ValueError("Failed to load data. Please check your data_configs paths.")
+    
+    # 🔴 Auto-detect input channels from data
+    # 모든 데이터가 동일한 channel 수를 가져야 함
+    n_channels = wafer_maps[0].shape[0]  # (C, H, W) - C는 채널 수
+
+    # Safety check: 모든 데이터가 동일한 channel 수를 가지는지 확인
+    for i, wm in enumerate(wafer_maps[:10]):  # 처음 10개만 확인
+        if wm.shape[0] != n_channels:
+            raise ValueError(
+                f"Channel mismatch at index {i}: "
+                f"expected {n_channels}, got {wm.shape[0]}"
+            )
+
+    print(f"✅ Auto-detected input channels: {n_channels}")
+    print(f"   (All {len(wafer_maps)} samples have {n_channels} channels)")
 
     # Create dataloaders from real data
     # IMPORTANT: use_augmentation=False because BYOL applies augmentation in training loop
@@ -168,7 +183,7 @@ def train_byol_wafer(config):
     # Create model
     print("\nCreating BYOL model...")
     model = BYOL(
-        input_channels=config['input_channels'],
+        input_channels=n_channels,  # 🔴 Auto-detected
         encoder_dim=config['encoder_dim'],
         projector_hidden=config['projector_hidden'],
         projector_out=config['projector_out'],
@@ -406,7 +421,7 @@ def get_default_config(path):
         'predictor_hidden': 1024,
         'use_radial_encoding': True,
         'use_attention': True,
-        'input_channels':10, # 0을 제외한 1부터 채널 수 입력 필요
+        # 'input_channels':10, # Auto-detected from data
 
         # Training
         'epochs': 100,
@@ -438,8 +453,8 @@ def get_default_config(path):
         # Paths
         'save_dir': 'checkpoints',
         'log_dir': 'logs',
-        #'resume_path': None
-        'resume_path': f"{path}/clustering/byol/checkpoints/final_model.pth"
+        'resume_path': None
+        # 'resume_path': f"{path}/clustering/byol/checkpoints/final_model.pth"
     }
 
     return config

@@ -9,9 +9,97 @@ from utils.density_aware_filter import DensityAwareWaferMapFilter
 from utils.region_aware_filter import RegionAwareWaferMapFilter
 
 
-def prepare_clean_data(data_configs, use_filter=True, filter_params=None, use_density_aware=False, use_region_aware=False):
+def convert_to_multichannel(wafer_map, n_categories=10):
     """
-    여러 제품 데이터를 로드하고 완전히 정리 + 필터링
+    Convert wafer map to multi-channel format
+    
+    Args:
+        wafer_map: numpy array
+                   - Binary: (H, W) with values {0, 1}
+                   - Category: (n_cat, H, W) with values {0, 1} for each category
+        n_categories: number of categories (default: 10)
+    
+    Returns:
+        multi_channel: (n_categories+1, H, W) numpy array
+                      channel[0] = binary (spatial pattern)
+                      channel[1:n+1] = category-specific
+    """
+    # Detect input format
+    if len(wafer_map.shape) == 2:
+        # Binary data: (H, W)
+        H, W = wafer_map.shape
+        multi_channel = np.zeros((n_categories + 1, H, W), dtype=np.float32)
+        
+        # Channel 0: binary map
+        multi_channel[0] = wafer_map.astype(np.float32)
+        
+        # Channel 1-n: all zeros (no category info)
+        # Already initialized as zeros
+        
+    elif len(wafer_map.shape) == 3:
+        # Category data: (n_cat, H, W)
+        n_cat, H, W = wafer_map.shape
+        multi_channel = np.zeros((n_categories + 1, H, W), dtype=np.float32)
+        
+        # Channel 0: binary (any category > 0)
+        multi_channel[0] = (wafer_map.sum(axis=0) > 0).astype(np.float32)
+        
+        # Channel 1-n: category-specific
+        # Copy existing categories
+        multi_channel[1:n_cat+1] = wafer_map.astype(np.float32)
+        
+        # If n_cat < n_categories, remaining channels stay 0
+        
+    else:
+        raise ValueError(f"Unexpected wafer_map shape: {wafer_map.shape}")
+    
+    return multi_channel
+
+def detect_n_categories(data_configs):
+    """
+    Automatically detect maximum number of categories from data
+    """
+    max_categories = 0
+    
+    for config in data_configs:
+        file_path = config["path"]
+        
+        if not os.path.exists(file_path):
+            continue
+        
+        try:
+            data = np.load(file_path, allow_pickle=True)
+            maps = data['maps']
+            
+            # Check first sample
+            if len(maps) > 0:
+                sample = maps[0]
+                
+                # Convert to array if needed
+                if not isinstance(sample, np.ndarray):
+                    sample = np.array(sample)
+                
+                # Category data: 3D (n_cat, H, W)
+                if len(sample.shape) == 3:
+                    n_cat = sample.shape[0]
+                    max_categories = max(max_categories, n_cat)
+                # Binary data: 2D (H, W)
+                elif len(sample.shape) == 2:
+                    pass  # Binary, no categories
+                    
+        except Exception as e:
+            print(f"⚠️  Failed to detect categories from {file_path}: {e}")
+            continue
+    
+    print(f"✅ Detected maximum categories: {max_categories}")
+    return max_categories
+
+
+
+def prepare_clean_data(data_configs, use_filter=True, filter_params=None, 
+                       use_density_aware=False, use_region_aware=False):
+    """
+    여러 제품 데이터를 로드하고 완전히 정리 + 필터링 + Multi-channel 변환
 
     Args:
         data_configs: [
@@ -21,23 +109,30 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None, use_de
         use_filter: 필터링 적용 여부
         filter_params: 필터 파라미터 딕셔너리
         use_density_aware: True면 밀도 기반 적응형 필터 사용 (권장!)
+        use_region_aware: True면 region-aware 필터 사용
 
     Returns:
-        clean_maps, clean_labels
+        clean_maps: List of (n_categories+1, H, W) arrays
+        clean_labels: List of labels
+        info: List of filter info dicts
     """
 
     print("="*60)
+    
+    # 1. 카테고리 개수 자동 감지
+    n_categories = detect_n_categories(data_configs)
+    print(f"🔍 Auto-detected categories: {n_categories}")
+    
     mode_str = "밀도 기반 적응형" if use_density_aware else "일반"
     print(f"🧹 데이터 완전 정리 시작" + (f" ({mode_str} 필터링 포함)" if use_filter else ""))
+    print(f"📊 Multi-channel format: {n_categories + 1} channels")
     print("="*60)
     
     # 필터 초기화
     if use_filter:
         if use_density_aware:
-            # 밀도 기반 적응형 필터
             filter_obj = DensityAwareWaferMapFilter()
         else:
-            # 일반 필터
             if filter_params is None:
                 filter_params = {
                     'min_component_size': 5,
@@ -77,62 +172,69 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None, use_de
 
             for i, (wm, label) in enumerate(zip(maps, labels)):
                 try:
-                    # 완전한 정리 과정
-                    if isinstance(wm, np.ndarray) and wm.dtype == object:
-                        # object array → 강제 변환
-                        clean_wm = np.array(wm.tolist(), dtype=np.float32)
-                    elif isinstance(wm, np.ndarray):
-                        clean_wm = wm.astype(np.float32)
-                    elif isinstance(wm, (list, tuple)):
-                        clean_wm = np.array(wm, dtype=np.float32)
+                    # wm을 numpy array로 변환
+                    if not isinstance(wm, np.ndarray):
+                        wm = np.array(wm.tolist() if hasattr(wm, 'tolist') else wm, dtype=np.float32)
+                    elif wm.dtype == object:
+                        wm = np.array(wm.tolist(), dtype=np.float32)
                     else:
-                        clean_wm = np.array(wm, dtype=np.float32)
-
-                    # 검증
-                    if len(clean_wm.shape) != 2 or clean_wm.shape[0] == 0 or clean_wm.shape[1] == 0:
+                        wm = wm.astype(np.float32)
+                    
+                    # 검증: 2D (binary) 또는 3D (category)
+                    if len(wm.shape) == 2:
+                        # Binary data (H, W)
+                        H, W = wm.shape
+                        if H == 0 or W == 0:
+                            continue
+                        
+                    elif len(wm.shape) == 3:
+                        # Category data (n_cat, H, W)
+                        n_cat, H, W = wm.shape
+                        if n_cat == 0 or H == 0 or W == 0:
+                            continue
+                    else:
+                        # Invalid shape
                         continue
-
+                    
                     # NaN, Inf 처리
-                    if np.any(np.isnan(clean_wm)) or np.any(np.isinf(clean_wm)):
-                        clean_wm = np.nan_to_num(clean_wm, nan=0.0, posinf=1.0, neginf=0.0)
+                    if np.any(np.isnan(wm)) or np.any(np.isinf(wm)):
+                        wm = np.nan_to_num(wm, nan=0.0, posinf=1.0, neginf=0.0)
 
-                    # 정규화
-                    if clean_wm.max() > 0:
-                        clean_wm = clean_wm / clean_wm.max()
-
-                    # 🔹 필터링 적용
-                    if use_filter and clean_wm.sum() > 0:
-                        original_defects = clean_wm.sum()
-                        clean_wm_org = clean_wm.copy()
+                    # 정규화 (0-1 range)
+                    if wm.max() > 1.0:
+                        wm = wm / wm.max()
+                    
+                    # 🔹 Multi-channel 변환
+                    multi_channel_wm = convert_to_multichannel(wm, n_categories)
+                    
+                    # 🔹 필터링 적용 (channel 0에만)
+                    if use_filter and multi_channel_wm[0].sum() > 0:
+                        original_defects = multi_channel_wm[0].sum()
+                        
                         if use_density_aware:
-                            # 밀도 기반 적응형 필터링
-                            clean_wm, info = filter_obj.filter_single_map(clean_wm)
-                            filtered_defects = clean_wm.sum()
-                            if info['strategy'] == "very_low" and use_region_aware:
-                                region_obj = RegionAwareWaferMapFilter(n_sectors=12, n_rings=3, sector_density_threshold=0.1, closing_kernel_size=6, min_region_size=50)
-                                clean_wm = region_obj.detect_clustering_regions(clean_wm.squeeze())
-                                clean_wm = clean_wm.unsqueeze(dim=0)
+                            filtered_ch0, info = filter_obj.filter_single_map(multi_channel_wm[0])
+                            multi_channel_wm[0] = filtered_ch0
                         else:
-                            # 일반 필터링
-                            clean_wm = filter_obj.filter_single_map(clean_wm)
-                            filtered_defects = clean_wm.sum()
+                            multi_channel_wm[0] = filter_obj.filter_single_map(multi_channel_wm[0])
                             info = None
                         
-                        # 너무 많이 제거되면 스킵 (패턴이 거의 사라짐) -> 이게 진짜 필요할까?
+                        filtered_defects = multi_channel_wm[0].sum()
+                        
+                        # 너무 많이 제거되면 스킵
                         if filtered_defects < original_defects * 0.2:
-                            clean_wm = clean_wm_org.copy()
-                            #label = label + "_filter"
-                            # continue
+                            continue
                         
                         if filtered_defects < original_defects:
                             filtered_count += 1
+                    
                     # 최종 검증
-                    assert isinstance(clean_wm, np.ndarray)
-                    assert clean_wm.dtype == np.float32
-                    assert len(clean_wm.shape) == 2
-                    assert not np.any(np.isnan(clean_wm))
+                    assert isinstance(multi_channel_wm, np.ndarray)
+                    assert multi_channel_wm.dtype == np.float32
+                    assert len(multi_channel_wm.shape) == 3  # (C, H, W)
+                    assert multi_channel_wm.shape[0] == n_categories + 1
+                    assert not np.any(np.isnan(multi_channel_wm))
 
-                    clean_maps.append(clean_wm)
+                    clean_maps.append(multi_channel_wm)
                     clean_labels.append(label)
                     info_list.append(info)
 
@@ -142,6 +244,7 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None, use_de
 
             success_rate = len(clean_maps) / len(maps) * 100
             print(f"   정리됨: {len(clean_maps)}개 ({success_rate:.1f}%)")
+            print(f"   Shape: ({n_categories + 1}, H, W)")
             if use_filter and filtered_count > 0:
                 print(f"   필터링됨: {filtered_count}개 ({filtered_count/len(clean_maps)*100:.1f}%)")
 
@@ -154,6 +257,7 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None, use_de
             continue
 
     print(f"\n✅ 전체 정리 완료: {len(all_clean_maps)}개")
+    print(f"   Final shape per sample: ({n_categories + 1}, H, W)")
     return all_clean_maps, all_clean_labels, all_info
 
 
@@ -176,7 +280,7 @@ class MultiSizeWaferDataset(Dataset):
         """
         self.wafer_maps = []
         self.labels = []
-        self.original_indices = []  # 🔴 추가!
+        self.original_indices = []
         self.target_size = target_size
         self.use_filter = use_filter
         self.filter_on_the_fly = filter_on_the_fly
@@ -197,32 +301,38 @@ class MultiSizeWaferDataset(Dataset):
                         'edge_preserve_strength': 0.9
                     }
                 self.filter_obj = WaferMapFilter(**filter_params)
+        
         print(f"🛡️  Dataset 생성 중...")
         if use_filter and not filter_on_the_fly:
             print(f"   사전 필터링 적용 중...")
 
         for idx, (wm, label) in enumerate(zip(wafer_maps, labels)):
+            # 🔴 Shape 검증 수정: (C, H, W) 형식
             if (isinstance(wm, np.ndarray) and
                 wm.dtype == np.float32 and
-                len(wm.shape) == 2 and
-                wm.shape[0] > 0 and wm.shape[1] > 0):
+                len(wm.shape) == 3 and      # (C, H, W)
+                wm.shape[0] > 0 and         # C > 0
+                wm.shape[1] > 0 and         # H > 0
+                wm.shape[2] > 0):           # W > 0
 
                 # 사전 필터링 (filter_on_the_fly=False인 경우)
+                # Channel 0에만 적용
                 if use_filter and not filter_on_the_fly:
-                    if wm.sum() > 0:
-                        original_defects = wm.sum()
+                    if wm[0].sum() > 0:
+                        original_defects = wm[0].sum()
                         
                         if use_density_aware:
-                            wm, info = self.filter_obj.filter_single_map(wm)
+                            wm[0], info = self.filter_obj.filter_single_map(wm[0])
                         else:
-                            wm = self.filter_obj.filter_single_map(wm)
+                            wm[0] = self.filter_obj.filter_single_map(wm[0])
                         
                         # 너무 많이 제거되면 스킵
-                        if wm.sum() < original_defects * 0.2:
+                        if wm[0].sum() < original_defects * 0.2:
                             continue
+                
                 self.wafer_maps.append(wm)
                 self.labels.append(label)
-                self.original_indices.append(idx)  # 🔴 원본 인덱스 저장
+                self.original_indices.append(idx)
 
         print(f"   최종 Dataset: {len(self.wafer_maps)}개")
 
@@ -230,23 +340,29 @@ class MultiSizeWaferDataset(Dataset):
         return len(self.wafer_maps)
 
     def __getitem__(self, idx):
-        wafer_map = self.wafer_maps[idx]
+        wafer_map = self.wafer_maps[idx]  # (C, H, W) - already multi-channel
         label = self.labels[idx]
-        original_idx = self.original_indices[idx]  # 🔴 추가
+        original_idx = self.original_indices[idx]
 
         # On-the-fly 필터링 (filter_on_the_fly=True인 경우)
+        # Note: 이미 prepare_clean_data에서 필터링 했으므로 보통은 skip
         if self.use_filter and self.filter_on_the_fly:
-            if wafer_map.sum() > 0:
+            # Channel 0에만 필터링 적용
+            if wafer_map[0].sum() > 0:
                 if self.use_density_aware:
-                    wafer_map, _ = self.filter_obj.filter_single_map(wafer_map)
+                    wafer_map[0], _ = self.filter_obj.filter_single_map(wafer_map[0])
                 else:
-                    wafer_map = self.filter_obj.filter_single_map(wafer_map)
+                    wafer_map[0] = self.filter_obj.filter_single_map(wafer_map[0])
 
         # 안전한 전처리
-        tensor = torch.tensor(wafer_map, dtype=torch.float32)
-        tensor_4d = tensor.unsqueeze(0).unsqueeze(0)
+        # wafer_map: (C, H, W) numpy array → (C, target_H, target_W) tensor
+        tensor = torch.tensor(wafer_map, dtype=torch.float32)  # (C, H, W)
+        
+        # Resize
+        # F.interpolate expects (B, C, H, W), so add batch dim
+        tensor_4d = tensor.unsqueeze(0)  # (1, C, H, W)
         resized = F.interpolate(tensor_4d, size=self.target_size, mode='bilinear', align_corners=False)
-        resized = resized.squeeze(0)  # (1, H, W)
+        resized = resized.squeeze(0)  # (C, target_H, target_W)
 
         # 🔴 Augmentation 적용 (training 시에만!)
         if self.is_training and self.use_augmentation:
@@ -254,12 +370,18 @@ class MultiSizeWaferDataset(Dataset):
         else:
             resized_aug = None
 
-        return resized, resized_aug, label, original_idx  # 🔴 인덱스도 반환
+        return resized, resized_aug, label, original_idx
     
     def _apply_augmentation(self, tensor):
         """
         회전 불변성을 위한 Augmentation
         D4 Dihedral group의 8가지 변환 중 하나를 균등하게 선택
+        
+        Args:
+            tensor: (C, H, W) - multi-channel
+        
+        Returns:
+            tensor: (C, H, W) - augmented
         """
         # 8가지 변환 중 하나를 균등하게 선택
         transform_id = torch.randint(0, 8, (1,)).item()
@@ -287,24 +409,32 @@ class MultiSizeWaferDataset(Dataset):
 def collate_fn(batch):
     """인덱스를 포함한 collate 함수
     + 문제 데이터를 자동으로 필터링하는 collate 함수
-    + 빈 맵(모두 0)도 제거"""
+    + 빈 맵(모두 0)도 제거
+    + Multi-channel 지원"""
 
     safe_data = []
     safe_data_aug = []
     safe_labels = []
-    safe_indices = []  # 🔴 추가
-    has_aug = True  # 🔹 첫 번째 유효한 샘플로 판단
+    safe_indices = []
+    has_aug = True
 
-    for data, data_aug, label, original_idx in batch:  # 🔴 4개 받기
+    for data, data_aug, label, original_idx in batch:
         try:
-            #if (isinstance(data, torch.Tensor) and data.dtype == torch.float32 and len(data.shape) == 3 and data.sum() > 0):  # 빈 맵 제거:
-            if (isinstance(data, torch.Tensor) and data.dtype == torch.float32 and len(data.shape) == 3):
-                safe_data.append(data)
-                safe_data_aug.append(data_aug)  # None이거나 tensor
-                safe_labels.append(label)
-                safe_indices.append(original_idx)  # 🔴 추가
+            # Shape 검증: (C, H, W)
+            if (isinstance(data, torch.Tensor) and
+                data.dtype == torch.float32 and
+                len(data.shape) == 3 and  # (C, H, W)
+                data.shape[0] > 0 and     # C > 0
+                data.shape[1] > 0 and     # H > 0
+                data.shape[2] > 0 and     # W > 0
+                data.sum() > 0):          # Not all zeros
 
-                # 🔹 첫 번째 샘플로 augmentation 여부 판단
+                safe_data.append(data)
+                safe_data_aug.append(data_aug)
+                safe_labels.append(label)
+                safe_indices.append(original_idx)
+
+                # 첫 번째 샘플로 augmentation 여부 판단
                 if len(safe_data) == 1:
                     has_aug = (data_aug is not None)
 
@@ -313,17 +443,18 @@ def collate_fn(batch):
 
     if len(safe_data) == 0:
         # 모든 샘플이 문제인 경우 더미 배치 반환
-        dummy = torch.zeros((1, 1, 128, 128), dtype=torch.float32)
-        return dummy, ["dummy"], [0]  # 🔴 dummy index
+        # Multi-channel dummy
+        dummy = torch.zeros((1, 11, 128, 128), dtype=torch.float32)  # 11 channels
+        return dummy, None, ["dummy"], [0]
 
     batch_data = torch.stack(safe_data)
-    # 🔹 augmentation이 있으면 stack, 없으면 None
+    
     if has_aug:
         batch_data_aug = torch.stack(safe_data_aug)
     else:
         batch_data_aug = None
 
-    return batch_data, batch_data_aug, safe_labels, safe_indices  # 🔴 4개 반환
+    return batch_data, batch_data_aug, safe_labels, safe_indices
 
 
 

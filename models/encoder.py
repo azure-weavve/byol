@@ -141,18 +141,18 @@ class WaferEncoder(nn.Module):
     ResNet-18 based encoder for wafer maps
 
     Architecture:
-        Input: (B, 1, 128, 128) - grayscale wafer map
-        Conv stem: 1 → 64 channels
+        Input: (B, C, 128, 128) - multi-channel wafer map (C = n_categories + 1)
+        Conv stem: C → 64 channels
         ResNet blocks: 64 → 128 → 256 → 512
         Global Average Pooling
         Output: (B, 512) - feature vector
 
-    Memory estimation (batch_size=256):
+    Memory estimation (batch_size=256, C=11):
         Parameters: ~11M
         Forward pass: ~2GB VRAM
     """
     def __init__(self,
-                 input_channels=1,
+                 input_channels=11,              # 🔴 1 → 11로 변경 (기본값)
                  output_dim=512,
                  use_radial_encoding=True,
                  use_attention=True,
@@ -167,7 +167,7 @@ class WaferEncoder(nn.Module):
         # Optional radial positional encoding
         if use_radial_encoding:
             self.radial_encoder = RadialPositionalEncoder(wafer_size, embedding_dim=16)
-            input_channels += 16
+            input_channels += 16  # 11 + 16 = 27 channels
         else:
             self.radial_encoder = None
 
@@ -177,22 +177,22 @@ class WaferEncoder(nn.Module):
         self.bn1 = nn.BatchNorm2d(64)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        # ResNet layers
+        # ResNet layers (기존과 동일)
         self.layer1 = self._make_layer(64, 64, layers[0], stride=1)
         self.layer2 = self._make_layer(64, 128, layers[1], stride=2)
         self.layer3 = self._make_layer(128, 256, layers[2], stride=2)
         self.layer4 = self._make_layer(256, 512, layers[3], stride=2)
 
-        # Optional self-attention
+        # Optional self-attention (기존과 동일)
         if use_attention:
             self.attention = SelfAttention2D(512, reduction=8)
         else:
             self.attention = None
 
-        # Global average pooling
+        # Global average pooling (기존과 동일)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
-        # Initialize weights
+        # Initialize weights (기존과 동일)
         self._initialize_weights()
 
     def _make_layer(self, in_channels, out_channels, blocks, stride=1):
@@ -298,7 +298,7 @@ def test_encoder():
 
     # Create model
     encoder = WaferEncoder(
-        input_channels=1,
+        input_channels=11,  # 🔴 11 channels
         use_radial_encoding=True,
         use_attention=True,
         wafer_size=(128, 128)
@@ -313,7 +313,7 @@ def test_encoder():
 
     # Test forward pass
     batch_size = 4
-    x = torch.randn(batch_size, 1, 128, 128)
+    x = torch.randn(batch_size, 11, 128, 128)  # 🔴 11 channels
 
     with torch.no_grad():
         output = encoder(x)

@@ -36,6 +36,7 @@ class BYOL(nn.Module):
         6. EMA update target network
     """
     def __init__(self,
+                 input_channels=11,          # 🔴 추가
                  encoder_dim=512,
                  projector_hidden=1024,
                  projector_out=256,
@@ -43,8 +44,7 @@ class BYOL(nn.Module):
                  use_radial_encoding=True,
                  use_attention=True,
                  wafer_size=(128, 128),
-                 tau=0.996,
-                 input_channels=10):
+                 tau=0.996):
         super(BYOL, self).__init__()
 
         self.encoder_dim = encoder_dim
@@ -53,7 +53,7 @@ class BYOL(nn.Module):
 
         # === Online Network (trainable) ===
         self.encoder_online = WaferEncoder(
-            input_channels=input_channels,
+            input_channels=input_channels,  # 🔴 전달
             output_dim=encoder_dim,
             use_radial_encoding=use_radial_encoding,
             use_attention=use_attention,
@@ -74,7 +74,7 @@ class BYOL(nn.Module):
 
         # === Target Network (EMA, no grad) ===
         self.encoder_target = WaferEncoder(
-            input_channels=input_channels,
+            input_channels=input_channels,  # 🔴 전달
             output_dim=encoder_dim,
             use_radial_encoding=use_radial_encoding,
             use_attention=use_attention,
@@ -290,6 +290,7 @@ def test_byol():
 
     # Create model
     model = BYOL(
+        input_channels=11,  # 🔴 11 channels
         encoder_dim=512,
         projector_hidden=1024,
         projector_out=256,
@@ -321,8 +322,8 @@ def test_byol():
 
     # Test forward pass
     batch_size = 4
-    view1 = torch.randn(batch_size, 1, 128, 128)
-    view2 = torch.randn(batch_size, 1, 128, 128)
+    view1 = torch.randn(batch_size, 11, 128, 128)
+    view2 = torch.randn(batch_size, 11, 128, 128)
 
     print(f"\nInput shapes: {view1.shape}, {view2.shape}")
 
