@@ -152,7 +152,7 @@ class WaferEncoder(nn.Module):
         Forward pass: ~2GB VRAM
     """
     def __init__(self,
-                 input_channels=11,              # 🔴 1 → 11로 변경 (기본값)
+                 input_channels=13,              # 🔴 1 → 13로 변경 (기본값)
                  output_dim=512,
                  use_radial_encoding=True,
                  use_attention=True,
@@ -298,7 +298,7 @@ def test_encoder():
 
     # Create model
     encoder = WaferEncoder(
-        input_channels=11,  # 🔴 11 channels
+        input_channels=13,  # 🔴 13 channels
         use_radial_encoding=True,
         use_attention=True,
         wafer_size=(128, 128)

@@ -36,7 +36,7 @@ class BYOL(nn.Module):
         6. EMA update target network
     """
     def __init__(self,
-                 input_channels=11,          # 🔴 추가
+                 input_channels=13,          # 🔴 추가
                  encoder_dim=512,
                  projector_hidden=1024,
                  projector_out=256,
@@ -290,7 +290,7 @@ def test_byol():
 
     # Create model
     model = BYOL(
-        input_channels=11,  # 🔴 11 channels
+        input_channels=13,  # 🔴 13 channels
         encoder_dim=512,
         projector_hidden=1024,
         projector_out=256,
@@ -322,8 +322,8 @@ def test_byol():
 
     # Test forward pass
     batch_size = 4
-    view1 = torch.randn(batch_size, 11, 128, 128)
-    view2 = torch.randn(batch_size, 11, 128, 128)
+    view1 = torch.randn(batch_size, 13, 128, 128)
+    view2 = torch.randn(batch_size, 13, 128, 128)
 
     print(f"\nInput shapes: {view1.shape}, {view2.shape}")
 
