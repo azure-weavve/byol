@@ -117,16 +117,16 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None,
         use_region_aware: True면 region-aware 필터 사용
 
     Returns:
-        clean_maps: List of (n_categories+1, H, W) arrays
+        clean_maps: List of (13, H, W) arrays (size 다를 수 있음)
         clean_labels: List of labels
         info: List of filter info dicts
     """
 
     print("="*60)
     
-    # 1. 카테고리 개수 자동 감지 (값 기반)
+    # 카테고리 개수 자동 감지
     n_categories = detect_n_categories(data_configs)
-    n_channels = n_categories + 1  # 0: spatial pattern, 1~n: categories
+    n_channels = n_categories + 1  # 13 channels
     
     mode_str = "밀도 기반 적응형" if use_density_aware else "일반"
     print(f"🧹 데이터 완전 정리 시작" + (f" ({mode_str} 필터링 포함)" if use_filter else ""))
@@ -169,27 +169,31 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None,
 
             print(f"   원본: {len(maps)}개")
 
-            # ========== 배치 변환 ==========
-            # maps를 numpy array로 변환
+            # numpy array로 변환
             if not isinstance(maps, np.ndarray):
                 maps = np.array(maps)
             
-            # object dtype 처리
+            # object dtype 확인 (제품 내에서도 size 다를 수 있음)
             if maps.dtype == object:
-                # 각 웨이퍼의 shape이 다를 수 있으므로 개별 처리 필요
-                maps_list = [np.array(m, dtype=np.float32) for m in maps]
+                # 개별 처리 필요
+                print(f"   ⚠️  웨이퍼 크기가 다름 - 개별 처리")
+                is_batch_possible = False
             else:
-                maps = maps.astype(np.float32)
-                maps_list = None  # 배치 처리 가능
+                # 배치 처리 가능
+                is_batch_possible = True
+                maps = maps.astype(np.int32)
             
-            # 배치 처리 가능한 경우 (모든 웨이퍼 shape 동일)
-            if maps_list is None:
-                # (n, H, W) → (n, 13, H, W) 배치 변환
+            clean_maps = []
+            clean_labels = []
+            info_list = []
+            filtered_count = 0
+
+            if is_batch_possible:
+                # ========== 제품 단위 배치 변환 ==========
                 multi_channel_maps = convert_to_multichannel(maps, n_categories=n_categories)
-                
                 print(f"   배치 변환 완료: {multi_channel_maps.shape}")
                 
-                # 개별 필터링 및 검증
+                # 필터링은 개별 처리 (channel 0만)
                 for i in range(len(multi_channel_maps)):
                     wm = multi_channel_maps[i]  # (13, H, W)
                     label = labels[i]
@@ -200,22 +204,33 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None,
                     
                     # 필터링 적용 (channel 0에만)
                     info = None
+                    wm_org = wm[0].copy()
                     if use_filter and wm[0].sum() > 0:
+                        original_defects = wm[0].sum()
+                        
                         if use_density_aware:
                             wm[0], info = filter_obj.filter_single_map(wm[0])
                         else:
                             wm[0] = filter_obj.filter_single_map(wm[0])
+                        
+                        filtered_defects = wm[0].sum()
+                        if filtered_defects < original_defects:
+                            wm[0] = wm_org.copy()
+                            filtered_count += 1
                     
-                    all_clean_maps.append(wm)
-                    all_clean_labels.append(label)
-                    all_info.append(info)
+                    clean_maps.append(wm)
+                    clean_labels.append(label)
+                    info_list.append(info)
             
             else:
-                # shape이 다른 경우 개별 처리
-                print(f"   ⚠️  웨이퍼 크기가 다름 - 개별 처리")
-                
-                for i, (wm, label) in enumerate(zip(maps_list, labels)):
+                # ========== 개별 처리 ==========
+                for i, (wm, label) in enumerate(zip(maps, labels)):
                     try:
+                        # numpy 변환
+                        if not isinstance(wm, np.ndarray):
+                            wm = np.array(wm)
+                        wm = wm.astype(np.int32)
+                        
                         # 2D 검증
                         if len(wm.shape) != 2 or wm.shape[0] == 0 or wm.shape[1] == 0:
                             continue
@@ -229,20 +244,35 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None,
                         
                         # 필터링 적용 (channel 0에만)
                         info = None
-                        if use_filter and multi_wm[0].sum() > 0:                            
+                        multi_wm_org = multi_wm[0].copy()
+                        if use_filter and multi_wm[0].sum() > 0:
+                            original_defects = multi_wm[0].sum()
+                            
                             if use_density_aware:
                                 multi_wm[0], info = filter_obj.filter_single_map(multi_wm[0])
                             else:
                                 multi_wm[0] = filter_obj.filter_single_map(multi_wm[0])
+                            
+                            filtered_defects = multi_wm[0].sum()
+                            if filtered_defects < original_defects:
+                                multi_wm[0] = multi_wm_org.copy()
+                                filtered_count += 1
                         
-                        all_clean_maps.append(multi_wm)
-                        all_clean_labels.append(label)
-                        all_info.append(info)
+                        clean_maps.append(multi_wm)
+                        clean_labels.append(label)
+                        info_list.append(info)
                         
                     except Exception as e:
                         continue
-            
-            print(f"   정리됨: {len(all_clean_maps)}개")
+
+            success_rate = len(clean_maps) / len(maps) * 100 if len(maps) > 0 else 0
+            print(f"   정리됨: {len(clean_maps)}개 ({success_rate:.1f}%)")
+            if use_filter and filtered_count > 0:
+                print(f"   필터링됨: {filtered_count}개 ({filtered_count/len(clean_maps)*100:.1f}%)")
+
+            all_clean_maps.extend(clean_maps)
+            all_clean_labels.extend(clean_labels)
+            all_info.extend(info_list)
 
         except Exception as e:
             print(f"❌ {name} 로딩 실패: {e}")
@@ -252,7 +282,7 @@ def prepare_clean_data(data_configs, use_filter=True, filter_params=None,
 
     print(f"\n{'='*60}")
     print(f"✅ 전체 정리 완료: {len(all_clean_maps)}개")
-    print(f"   Shape per sample: ({n_channels}, H, W)")
+    print(f"   Shape per sample: ({n_channels}, H, W) - H, W는 제품별 상이")
     print(f"{'='*60}")
     
     return all_clean_maps, all_clean_labels, all_info
