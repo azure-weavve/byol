@@ -14,7 +14,80 @@ import torch.nn as nn
 import time
 
 
-def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, epoch=0, verbose=True):
+def compute_variance_loss(features):
+    """
+    Feature variance를 유지하도록 regularization
+    
+    Args:
+        features: [batch_size, dim]
+    
+    Returns:
+        loss: variance가 낮으면 패널티
+    """
+    # 각 dimension의 std 계산
+    std_per_dim = features.std(dim=0)  # (dim,)
+    
+    # Std가 낮으면 loss 증가
+    # -log(std)를 사용하면 std가 0에 가까울수록 loss 무한대
+    variance_loss = -torch.log(std_per_dim.mean() + 1e-6)
+    
+    return variance_loss
+
+def compute_variance_loss_target_std(features, target_std=1.0, adaptive=False):
+    """
+    Feature std를 target 값에 맞추는 loss
+    
+    Args:
+        features: [batch_size, dim]
+        target_std: 목표 std (default: 1.0)
+        adaptive: True면 dimension별로 다른 target 허용
+    
+    Returns:
+        loss: scalar
+        current_std: 현재 평균 std
+    """
+    # Dimension별 std 계산
+    std_per_dim = features.std(dim=0)  # (dim,)
+    
+    if adaptive:
+        # Dimension별로 조정 (일부 dim은 중요도 높음)
+        # 현재는 단순 평균
+        avg_std = std_per_dim.mean()
+    else:
+        avg_std = std_per_dim.mean()
+    
+    # MSE loss to target
+    loss = (avg_std - target_std) ** 2
+    
+    return loss, avg_std.item()
+
+
+def compute_variance_loss_robust(features, target_std=1.0, margin=0.1):
+    """
+    더 robust한 버전: margin 내에서는 패널티 없음
+    
+    target_std = 1.0, margin = 0.1이면
+    → 0.9 ~ 1.1 범위는 패널티 0
+    → 범위 밖이면 패널티
+    """
+    std_per_dim = features.std(dim=0)
+    avg_std = std_per_dim.mean()
+    
+    # Margin 밖이면 패널티
+    lower_bound = target_std - margin
+    upper_bound = target_std + margin
+    
+    if avg_std < lower_bound:
+        loss = (avg_std - lower_bound) ** 2
+    elif avg_std > upper_bound:
+        loss = (avg_std - upper_bound) ** 2
+    else:
+        loss = torch.tensor(0.0, device=features.device)
+    
+    return loss, avg_std.item()
+
+
+def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, epoch=0, total_epochs=100, variance_config=None, verbose=True):
     """
     Train BYOL for one epoch
 
@@ -27,6 +100,12 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
         augmentation: augmentation function (BYOLAugmentation)
         epoch: current epoch number
         verbose: print progress
+        variance_config: {
+            'type': 'target_std',  # or 'target_std_robust'
+            'target_std': 1.0,
+            'margin': 0.1,         # for robust version
+            'weight': 0.2
+        }
 
     Returns:
         avg_loss: average loss for the epoch
@@ -34,7 +113,13 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
     """
     model.train()
 
+    variance_type = variance_config.get('type', 'original')
+    variance_weight = variance_config.get('weight', 0.0)
+
     total_loss = 0.0
+    total_byol_loss = 0.0
+    total_var_loss = 0.0
+    total_feat_std = 0.0
     total_cos_sim = 0.0
     total_batches = 0
 
@@ -71,27 +156,100 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
 
         # Forward pass
         optimizer.zero_grad()
-        loss = model(view1, view2)
+        
+        # 1. BYOL loss
+        byol_loss = model(view1, view2)
+        
+        # 2. Variance regularization
+        if variance_weight > 0:
+            with torch.no_grad():
+                model.encoder_online.eval()
+            
+            features_1 = model.encoder_online(view1)
+            features_2 = model.encoder_online(view2)
+            
+            model.encoder_online.train()
+            
+            all_features = torch.cat([features_1, features_2], dim=0)
+            
+            # Variance loss 선택
+            if variance_type == 'target_std':
+                var_loss, current_std = compute_variance_loss_target_std(
+                    all_features,
+                    target_std=variance_config.get('target_std', 1.0)
+                )
+            elif variance_type == 'target_std_robust':
+                var_loss, current_std = compute_variance_loss_robust(
+                    all_features,
+                    target_std=variance_config.get('target_std', 1.0),
+                    margin=variance_config.get('margin', 0.1)
+                )
+            else:
+                # Original
+                var_loss = compute_variance_loss(all_features)
+                current_std = all_features.std(dim=0).mean().item()
+            
+            # ✅ current_std를 그대로 사용!
+            total_feat_std += current_std
+            
+            # Cosine similarity 계산
+            with torch.no_grad():
+                normalized = all_features / (all_features.norm(dim=1, keepdim=True) + 1e-8)
+                # Efficient sampling for large batches
+                n_samples = min(100, all_features.size(0))
+                if n_samples >= 2:
+                    indices = torch.randperm(all_features.size(0))[:n_samples]
+                    sample_features = normalized[indices]
+                    cos_sim_matrix = torch.mm(sample_features, sample_features.T)
+                    mask = ~torch.eye(n_samples, dtype=torch.bool, device=device)
+                    avg_cos_sim_batch = cos_sim_matrix[mask].mean().item()
+                else:
+                    avg_cos_sim_batch = 0.0
+                
+                total_cos_sim += avg_cos_sim_batch
+            
+            # Total loss
+            total_loss_batch = byol_loss + variance_weight * var_loss
+        else:
+            var_loss = torch.tensor(0.0, device=device)
+            current_std = 0.0
+            avg_cos_sim_batch = 0.0
+            total_loss_batch = byol_loss
 
         # Backward pass
-        loss.backward()
+        total_loss_batch.backward()
         optimizer.step()
 
         # Update target network with EMA
         model.update_target_network(tau=tau)
 
         # Track metrics
-        total_loss += loss.item()
+        total_loss += total_loss_batch.item()
+        total_byol_loss += byol_loss.item()
+        total_var_loss += var_loss.item()
         total_batches += 1
 
         # Print progress
-        if verbose and (batch_idx % 10 == 0 or batch_idx == total_batches_count - 1):
-            print(f"Epoch {epoch+1} [Train] [{batch_idx+1}/{total_batches_count}] "
-                  f"Loss: {loss.item():.4f}, Tau: {tau:.4f}")
+        if verbose and (batch_idx % 5 == 0 or batch_idx == total_batches_count - 1):
+            if variance_weight > 0:
+                print(f"Epoch {epoch+1} [Train] [{batch_idx+1}/{total_batches_count}] "
+                    f"Total: {total_loss_batch.item():.4f}, "
+                      f"BYOL: {byol_loss.item():.4f}, "
+                      f"Var: {var_loss.item():.4f}, "
+                      f"FeatStd: {current_std:.4f}, "
+                      f"Tau: {tau:.4f}")
+            else:
+                print(f"Epoch {epoch+1} [Train] [{batch_idx+1}/{total_batches_count}] "
+                    f"Loss: {total_loss_batch.item():.4f}")
 
-    avg_loss = total_loss / total_batches
-
-    return avg_loss
+    # Calculate averages
+    avg_total_loss = total_loss / total_batches
+    avg_byol_loss = total_byol_loss / total_batches
+    avg_var_loss = total_var_loss / total_batches
+    avg_feat_std = total_feat_std / total_batches if variance_weight > 0 else 0.0
+    avg_cos_sim = total_cos_sim / total_batches if variance_weight > 0 else 0.0
+    
+    return avg_total_loss, avg_byol_loss, avg_var_loss, avg_feat_std, avg_cos_sim
 
 
 def validate_byol_epoch(model, dataloader, device, augmentation, verbose=True):
@@ -246,7 +404,7 @@ def extract_features(model, dataloader, device, use_target=True, verbose=True):
         return all_features, None
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, filepath, **kwargs):
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, filepath, best_val_loss=None, **kwargs):
     """
     Save checkpoint
 
@@ -257,6 +415,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, filepath, **kwargs
         epoch: current epoch
         loss: current loss
         filepath: path to save checkpoint
+        best_val_loss: best validation loss so far (optional)  # 🔴 추가
         **kwargs: additional info to save
     """
     checkpoint = {
@@ -268,6 +427,10 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, filepath, **kwargs
 
     if scheduler is not None:
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+        
+    # 🔴 best_val_loss 저장
+    if best_val_loss is not None:
+        checkpoint['best_val_loss'] = best_val_loss
 
     # Add any additional info
     checkpoint.update(kwargs)
@@ -290,6 +453,7 @@ def load_checkpoint(model, optimizer, scheduler, filepath, device):
     Returns:
         epoch: epoch to resume from
         loss: loss at checkpoint
+        best_val_loss: best validation loss (if available)
     """
     checkpoint = torch.load(filepath, map_location=device)
 
@@ -301,11 +465,12 @@ def load_checkpoint(model, optimizer, scheduler, filepath, device):
 
     epoch = checkpoint['epoch']
     loss = checkpoint['loss']
+    best_val_loss = checkpoint.get('best_val_loss', float('inf'))  # 🔴 추가
 
     print(f"Checkpoint loaded from {filepath}")
-    print(f"Resuming from epoch {epoch+1}, loss: {loss:.4f}")
+    print(f"Resuming from epoch {epoch+1}, loss: {loss:.4f}, best_val_loss: {best_val_loss:.4f}")
 
-    return epoch, loss
+    return epoch, loss, best_val_loss  # 🔴 3개 반환
 
 
 class EarlyStopping:

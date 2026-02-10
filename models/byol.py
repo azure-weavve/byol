@@ -1,362 +1,334 @@
 """
-BYOL (Bootstrap Your Own Latent) Model
+WaferEncoder: ResNet-18 based encoder for wafer map pattern learning
 
-Complete implementation integrating:
-- Online network (encoder + projector + predictor)
-- Target network (encoder + projector, EMA updated)
-- Loss computation
-- EMA update mechanism
-
-PyTorch 1.4.0 compatible
+PyTorch 1.4.0 compatible implementation
 """
 
 import torch
 import torch.nn as nn
-import copy
-from .encoder import WaferEncoder
-from .projector import Projector, Predictor, symmetric_byol_loss
+import torch.nn.functional as F
+import math
 
 
-class BYOL(nn.Module):
+class RadialPositionalEncoder(nn.Module):
     """
-    BYOL model for wafer map pattern learning
+    Encodes radial distance from wafer center
+    Helps model understand center vs edge patterns
+    """
+    def __init__(self, wafer_size=(128, 128), embedding_dim=16):
+        super(RadialPositionalEncoder, self).__init__()
+        self.wafer_size = wafer_size
+        self.embedding_dim = embedding_dim
+
+        # Create radial distance map
+        h, w = wafer_size
+        center_h, center_w = h / 2.0, w / 2.0
+
+        y_coords = torch.arange(h).float() - center_h
+        x_coords = torch.arange(w).float() - center_w
+
+        yy, xx = torch.meshgrid(y_coords, x_coords)
+        radial_dist = torch.sqrt(xx ** 2 + yy ** 2)
+
+        # Normalize to [0, 1]
+        radial_dist = radial_dist / radial_dist.max()
+
+        # Register as buffer (not trainable parameter)
+        self.register_buffer('radial_dist', radial_dist.unsqueeze(0).unsqueeze(0))
+
+        # Learnable embedding
+        self.conv = nn.Conv2d(1, embedding_dim, kernel_size=1)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, C, H, W) input tensor
+        Returns:
+            (B, C + embedding_dim, H, W) with radial encoding concatenated
+        """
+        B = x.size(0)
+        radial_features = self.conv(self.radial_dist.expand(B, -1, -1, -1))
+        return torch.cat([x, radial_features], dim=1)
+
+
+class SelfAttention2D(nn.Module):
+    """
+    Self-attention for capturing global pattern relationships
+    PyTorch 1.4.0 compatible version
+    """
+    def __init__(self, in_channels, reduction=8):
+        super(SelfAttention2D, self).__init__()
+        self.in_channels = in_channels
+        self.reduction = reduction
+
+        # Query, Key, Value projections
+        self.query_conv = nn.Conv2d(in_channels, in_channels // reduction, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels // reduction, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+        # Learnable attention scaling
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, C, H, W)
+        Returns:
+            (B, C, H, W) with self-attention applied
+        """
+        B, C, H, W = x.size()
+
+        # Project to Q, K, V
+        query = self.query_conv(x).view(B, -1, H * W).permute(0, 2, 1)  # (B, H*W, C')
+        key = self.key_conv(x).view(B, -1, H * W)  # (B, C', H*W)
+        value = self.value_conv(x).view(B, -1, H * W)  # (B, C, H*W)
+
+        # Attention weights
+        attention = torch.bmm(query, key)  # (B, H*W, H*W)
+        attention = F.softmax(attention, dim=-1)
+
+        # Apply attention to values
+        out = torch.bmm(value, attention.permute(0, 2, 1))  # (B, C, H*W)
+        out = out.view(B, C, H, W)
+
+        # Residual connection with learnable gate
+        out = self.gamma * out + x
+
+        return out
+
+
+class BasicBlock(nn.Module):
+    """
+    Basic ResNet block with 2 conv layers
+    """
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3,
+                               stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = F.relu(out, inplace=True)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = F.relu(out, inplace=True)
+
+        return out
+
+
+class WaferEncoder(nn.Module):
+    """
+    ResNet-18 based encoder for wafer maps
 
     Architecture:
-        Online network:
-            encoder_online → projector_online → predictor
-        Target network (EMA):
-            encoder_target → projector_target
+        Input: (B, C, 128, 128) - multi-channel wafer map (C = n_categories + 1)
+        Conv stem: C → 64 channels
+        ResNet blocks: 64 → 128 → 256 → 512
+        Global Average Pooling
+        Output: (B, 512) - feature vector
 
-    Training:
-        1. Two augmented views: v1, v2
-        2. Online forward: p1, p2
-        3. Target forward: z1, z2 (no grad)
-        4. Loss: symmetric_loss(p1, z2, p2, z1)
-        5. Backprop on online network only
-        6. EMA update target network
+    Memory estimation (batch_size=256, C=11):
+        Parameters: ~11M
+        Forward pass: ~2GB VRAM
     """
     def __init__(self,
-                 input_channels=13,          # 🔴 추가
-                 encoder_dim=512,
-                 projector_hidden=1024,
-                 projector_out=256,
-                 predictor_hidden=1024,
+                 input_channels=13,              # 🔴 1 → 13로 변경 (기본값)
+                 output_dim=512,
                  use_radial_encoding=True,
                  use_attention=True,
                  wafer_size=(128, 128),
-                 tau=0.996):
-        super(BYOL, self).__init__()
+                 layers=[2, 2, 2, 2]):  # ResNet-18 configuration
+        super(WaferEncoder, self).__init__()
 
-        self.encoder_dim = encoder_dim
-        self.projector_out = projector_out
-        self.tau = tau
+        self.use_radial_encoding = use_radial_encoding
+        self.use_attention = use_attention
+        self.output_dim = output_dim
 
-        # === Online Network (trainable) ===
-        self.encoder_online = WaferEncoder(
-            input_channels=input_channels,  # 🔴 전달
-            output_dim=encoder_dim,
-            use_radial_encoding=use_radial_encoding,
-            use_attention=use_attention,
-            wafer_size=wafer_size
-        )
-
-        self.projector_online = Projector(
-            input_dim=encoder_dim,
-            hidden_dim=projector_hidden,
-            output_dim=projector_out
-        )
-
-        self.predictor = Predictor(
-            input_dim=projector_out,
-            hidden_dim=predictor_hidden,
-            output_dim=projector_out
-        )
-
-        # === Target Network (EMA, no grad) ===
-        self.encoder_target = WaferEncoder(
-            input_channels=input_channels,  # 🔴 전달
-            output_dim=encoder_dim,
-            use_radial_encoding=use_radial_encoding,
-            use_attention=use_attention,
-            wafer_size=wafer_size
-        )
-
-        self.projector_target = Projector(
-            input_dim=encoder_dim,
-            hidden_dim=projector_hidden,
-            output_dim=projector_out
-        )
-
-        # Initialize target as copy of online
-        self._initialize_target_network()
-
-        # Disable gradients for target network
-        for param in self.encoder_target.parameters():
-            param.requires_grad = False
-        for param in self.projector_target.parameters():
-            param.requires_grad = False
-
-    def _initialize_target_network(self):
-        """Initialize target network as exact copy of online network"""
-        # Copy encoder
-        self.encoder_target.load_state_dict(self.encoder_online.state_dict())
-        # Copy projector
-        self.projector_target.load_state_dict(self.projector_online.state_dict())
-
-    @torch.no_grad()
-    def update_target_network(self, tau=None):
-        """
-        Exponential Moving Average update of target network
-
-        Args:
-            tau: momentum coefficient (0.996 ~ 0.999)
-                 If None, use self.tau
-
-        Update rule:
-            ξ ← τ·ξ + (1-τ)·θ
-        """
-        if tau is None:
-            tau = self.tau
-
-        # Update encoder
-        for online_params, target_params in zip(
-            self.encoder_online.parameters(),
-            self.encoder_target.parameters()
-        ):
-            target_params.data = tau * target_params.data + (1 - tau) * online_params.data
-
-        # Update projector
-        for online_params, target_params in zip(
-            self.projector_online.parameters(),
-            self.projector_target.parameters()
-        ):
-            target_params.data = tau * target_params.data + (1 - tau) * online_params.data
-
-    def forward(self, view1, view2):
-        """
-        Forward pass for training
-
-        Args:
-            view1: (B, 1, H, W) first augmented view
-            view2: (B, 1, H, W) second augmented view
-
-        Returns:
-            loss: BYOL loss (symmetric)
-            Optional: predictions and projections for monitoring
-        """
-        # === Online network forward ===
-        # View 1
-        feat1_online = self.encoder_online(view1)
-        proj1_online = self.projector_online(feat1_online)
-        pred1 = self.predictor(proj1_online)
-
-        # View 2
-        feat2_online = self.encoder_online(view2)
-        proj2_online = self.projector_online(feat2_online)
-        pred2 = self.predictor(proj2_online)
-
-        # === Target network forward (no grad) ===
-        with torch.no_grad():
-            # View 1
-            feat1_target = self.encoder_target(view1)
-            proj1_target = self.projector_target(feat1_target)
-
-            # View 2
-            feat2_target = self.encoder_target(view2)
-            proj2_target = self.projector_target(feat2_target)
-
-        # === Compute symmetric loss ===
-        loss = symmetric_byol_loss(pred1, proj2_target, pred2, proj1_target)
-
-        return loss
-
-    def encode(self, x, use_target=False):
-        """
-        Extract features for inference/evaluation
-
-        Args:
-            x: (B, 1, H, W) wafer map
-            use_target: if True, use target encoder (recommended after training)
-
-        Returns:
-            (B, encoder_dim) features
-        """
-        if use_target:
-            with torch.no_grad():
-                return self.encoder_target(x)
+        # Optional radial positional encoding
+        if use_radial_encoding:
+            self.radial_encoder = RadialPositionalEncoder(wafer_size, embedding_dim=16)
+            input_channels += 16  # 11 + 16 = 27 channels
         else:
-            return self.encoder_online(x)
+            self.radial_encoder = None
 
-    def get_embeddings(self, x, use_target=True):
+        # Initial convolution stem
+        self.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2,
+                               padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # ResNet layers (기존과 동일)
+        self.layer1 = self._make_layer(64, 64, layers[0], stride=1)
+        self.layer2 = self._make_layer(64, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(128, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(256, 512, layers[3], stride=2)
+
+        # Optional self-attention (기존과 동일)
+        if use_attention:
+            self.attention = SelfAttention2D(512, reduction=8)
+        else:
+            self.attention = None
+
+        # Global average pooling (기존과 동일)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Initialize weights (기존과 동일)
+        self._initialize_weights()
+
+    def _make_layer(self, in_channels, out_channels, blocks, stride=1):
+        """Create a ResNet layer with multiple blocks"""
+        downsample = None
+        if stride != 1 or in_channels != out_channels:
+            downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1,
+                         stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+        layers = []
+        layers.append(BasicBlock(in_channels, out_channels, stride, downsample))
+
+        for _ in range(1, blocks):
+            layers.append(BasicBlock(out_channels, out_channels))
+
+        return nn.Sequential(*layers)
+
+    def _initialize_weights(self):
+        """Initialize weights using He initialization"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+    def forward(self, x):
         """
-        Get embeddings for clustering/retrieval
-
         Args:
-            x: (B, 1, H, W) wafer map
-            use_target: use target encoder (more stable)
-
+            x: (B, 1, 128, 128) wafer map
         Returns:
-            (B, encoder_dim) embeddings
+            (B, 512) feature vector
         """
-        with torch.no_grad():
-            if use_target:
-                features = self.encoder_target(x)
-            else:
-                features = self.encoder_online(x)
+        # Optional radial encoding
+        if self.radial_encoder is not None:
+            x = self.radial_encoder(x)
+
+        # Conv stem
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x, inplace=True)
+        x = self.maxpool(x)
+
+        # ResNet blocks
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        # Optional self-attention
+        if self.attention is not None:
+            x = self.attention(x)
+
+        # Global pooling
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+
+        return x
+
+    def get_feature_maps(self, x):
+        """
+        Get intermediate feature maps for visualization
+        Returns feature maps from each layer
+        """
+        features = {}
+
+        if self.radial_encoder is not None:
+            x = self.radial_encoder(x)
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x, inplace=True)
+        features['stem'] = x
+
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        features['layer1'] = x
+
+        x = self.layer2(x)
+        features['layer2'] = x
+
+        x = self.layer3(x)
+        features['layer3'] = x
+
+        x = self.layer4(x)
+        features['layer4'] = x
+
+        if self.attention is not None:
+            x = self.attention(x)
+            features['attention'] = x
 
         return features
 
-    def forward_with_monitoring(self, view1, view2):
-        """
-        Forward pass with additional monitoring information
 
-        Returns:
-            loss, monitoring_dict
-        """
-        # === Online network forward ===
-        feat1_online = self.encoder_online(view1)
-        proj1_online = self.projector_online(feat1_online)
-        pred1 = self.predictor(proj1_online)
-
-        feat2_online = self.encoder_online(view2)
-        proj2_online = self.projector_online(feat2_online)
-        pred2 = self.predictor(proj2_online)
-
-        # === Target network forward ===
-        with torch.no_grad():
-            feat1_target = self.encoder_target(view1)
-            proj1_target = self.projector_target(feat1_target)
-
-            feat2_target = self.encoder_target(view2)
-            proj2_target = self.projector_target(feat2_target)
-
-        # === Compute loss ===
-        loss = symmetric_byol_loss(pred1, proj2_target, pred2, proj1_target)
-
-        # === Monitoring info ===
-        with torch.no_grad():
-            # Feature statistics
-            feat_mean = feat1_online.mean().item()
-            feat_std = feat1_online.std().item()
-
-            # Projection statistics
-            proj_mean = proj1_online.mean().item()
-            proj_std = proj1_online.std().item()
-
-            # Cosine similarity between predictions and targets
-            pred1_norm = pred1 / (pred1.norm(dim=1, keepdim=True) + 1e-8)
-            proj2_norm = proj2_target / (proj2_target.norm(dim=1, keepdim=True) + 1e-8)
-            cos_sim = (pred1_norm * proj2_norm).sum(dim=1).mean().item()
-
-        monitoring_dict = {
-            'feat_mean': feat_mean,
-            'feat_std': feat_std,
-            'proj_mean': proj_mean,
-            'proj_std': proj_std,
-            'cos_similarity': cos_sim
-        }
-
-        return loss, monitoring_dict
-
-
-def get_tau_schedule(epoch, total_epochs, tau_base=0.996, tau_max=0.999):
-    """
-    Cosine schedule for tau (EMA momentum)
-
-    Args:
-        epoch: current epoch (0-indexed)
-        total_epochs: total number of epochs
-        tau_base: initial tau value
-        tau_max: final tau value
-
-    Returns:
-        tau value for current epoch
-
-    Strategy:
-        - Early training: tau low → target updates faster
-        - Late training: tau high → target more stable
-    """
-    import math
-
-    progress = epoch / total_epochs
-    tau = tau_max - (tau_max - tau_base) * (1 + math.cos(math.pi * progress)) / 2
-
-    return tau
-
-
-def test_byol():
-    """Test BYOL model"""
-    print("Testing BYOL model...")
+def test_encoder():
+    """Test encoder with sample input"""
+    print("Testing WaferEncoder...")
 
     # Create model
-    model = BYOL(
+    encoder = WaferEncoder(
         input_channels=13,  # 🔴 13 channels
-        encoder_dim=512,
-        projector_hidden=1024,
-        projector_out=256,
-        predictor_hidden=1024,
         use_radial_encoding=True,
         use_attention=True,
-        wafer_size=(128, 128),
-        tau=0.996
+        wafer_size=(128, 128)
     )
 
     # Count parameters
-    online_params = (
-        sum(p.numel() for p in model.encoder_online.parameters()) +
-        sum(p.numel() for p in model.projector_online.parameters()) +
-        sum(p.numel() for p in model.predictor.parameters())
-    )
+    total_params = sum(p.numel() for p in encoder.parameters())
+    trainable_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
 
-    target_params = (
-        sum(p.numel() for p in model.encoder_target.parameters()) +
-        sum(p.numel() for p in model.projector_target.parameters())
-    )
-
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    print(f"Online network parameters: {online_params:,}")
-    print(f"Target network parameters: {target_params:,}")
+    print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
-    print(f"Total parameters: {online_params + target_params:,}")
 
     # Test forward pass
     batch_size = 4
-    view1 = torch.randn(batch_size, 13, 128, 128)
-    view2 = torch.randn(batch_size, 13, 128, 128)
+    x = torch.randn(batch_size, 13, 128, 128)  # 🔴 13 channels
 
-    print(f"\nInput shapes: {view1.shape}, {view2.shape}")
-
-    # Training mode
-    model.train()
-    loss = model(view1, view2)
-    print(f"Training loss: {loss.item():.4f}")
-
-    # Test with monitoring
-    loss, monitoring = model.forward_with_monitoring(view1, view2)
-    print(f"\nMonitoring info:")
-    for key, value in monitoring.items():
-        print(f"  {key}: {value:.4f}")
-
-    # Test EMA update
-    tau_before = model.tau
-    model.update_target_network(tau=0.999)
-    print(f"\nEMA update with tau={0.999:.3f} completed")
-
-    # Test inference
-    model.eval()
     with torch.no_grad():
-        embeddings = model.get_embeddings(view1, use_target=True)
-    print(f"\nEmbedding shape: {embeddings.shape}")
+        output = encoder(x)
 
-    # Test tau schedule
-    print("\nTau schedule (100 epochs):")
-    for epoch in [0, 10, 30, 50, 70, 99]:
-        tau = get_tau_schedule(epoch, 100, tau_base=0.996, tau_max=0.999)
-        print(f"  Epoch {epoch:3d}: tau = {tau:.6f}")
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {output.shape}")
 
-    print("\nBYOL model test passed!")
+    # Test feature maps
+    features = encoder.get_feature_maps(x)
+    print("\nFeature map shapes:")
+    for name, feat in features.items():
+        print(f"  {name}: {feat.shape}")
+
+    print("\nWaferEncoder test passed!")
 
 
 if __name__ == "__main__":
-    test_byol()
+    test_encoder()

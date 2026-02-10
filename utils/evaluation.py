@@ -177,6 +177,8 @@ def visualize_k_distance_graph(features, min_samples=10, save_path=None):
     K-distance graph 시각화 (eps 선택 도움)
     """
     import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = 'NanumGothic'
+    plt.rcParams['axes.unicode_minus'] = False
     
     eps, k_distances = estimate_optimal_eps(features, min_samples, method='elbow')
     
