@@ -86,6 +86,32 @@ def compute_variance_loss_robust(features, target_std=1.0, margin=0.1):
     
     return loss, avg_std.item()
 
+def compute_covariance_loss(features):
+    """
+    VICReg style covariance regularization
+    차원 간 상관관계를 제거하여 directional collapse 방지
+    
+    Args:
+        features: [batch_size, dim]
+    Returns:
+        loss: scalar
+    """
+    N, D = features.shape
+    
+    # 평균 제거
+    features_centered = features - features.mean(dim=0)
+    
+    # Covariance matrix (D, D)
+    cov = (features_centered.T @ features_centered) / max(N - 1, 1)
+    
+    # Off-diagonal 원소의 제곱합
+    diag = torch.diag(torch.diag(cov))
+    off_diag = cov - diag
+    
+    loss = (off_diag ** 2).sum() / D
+    
+    return loss
+
 
 def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, epoch=0, total_epochs=100, variance_config=None, verbose=True):
     """
@@ -115,10 +141,12 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
 
     variance_type = variance_config.get('type', 'original')
     variance_weight = variance_config.get('weight', 0.0)
+    covariance_weight = variance_config.get('covariance_weight', 0.0)
 
     total_loss = 0.0
     total_byol_loss = 0.0
     total_var_loss = 0.0
+    total_cov_loss = 0.0  # 기존 total_var_loss 아래에 추가
     total_feat_std = 0.0
     total_cos_sim = 0.0
     total_batches = 0
@@ -161,7 +189,7 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
         byol_loss = model(view1, view2)
         
         # 2. Variance regularization
-        if variance_weight > 0:
+        if variance_weight > 0 or covariance_weight > 0:
             with torch.no_grad():
                 model.encoder_online.eval()
             
@@ -191,6 +219,12 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
             
             # ✅ current_std를 그대로 사용!
             total_feat_std += current_std
+
+            # 🆕 Covariance loss
+            if covariance_weight > 0:
+                cov_loss = compute_covariance_loss(all_features)
+            else:
+                cov_loss = torch.tensor(0.0, device=device)
             
             # Cosine similarity 계산
             with torch.no_grad():
@@ -209,9 +243,10 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
                 total_cos_sim += avg_cos_sim_batch
             
             # Total loss
-            total_loss_batch = byol_loss + variance_weight * var_loss
+            total_loss_batch = byol_loss + variance_weight * var_loss + covariance_weight * cov_loss
         else:
             var_loss = torch.tensor(0.0, device=device)
+            cov_loss = torch.tensor(0.0, device=device)  # 🆕
             current_std = 0.0
             avg_cos_sim_batch = 0.0
             total_loss_batch = byol_loss
@@ -227,6 +262,7 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
         total_loss += total_loss_batch.item()
         total_byol_loss += byol_loss.item()
         total_var_loss += var_loss.item()
+        total_cov_loss += cov_loss.item()  # total_var_loss 아래에 추가
         total_batches += 1
 
         # Print progress
@@ -236,6 +272,7 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
                     f"Total: {total_loss_batch.item():.4f}, "
                       f"BYOL: {byol_loss.item():.4f}, "
                       f"Var: {var_loss.item():.4f}, "
+                      f"Cov: {cov_loss.item():.4f}, "
                       f"FeatStd: {current_std:.4f}, "
                       f"Tau: {tau:.4f}")
             else:
@@ -246,10 +283,12 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
     avg_total_loss = total_loss / total_batches
     avg_byol_loss = total_byol_loss / total_batches
     avg_var_loss = total_var_loss / total_batches
-    avg_feat_std = total_feat_std / total_batches if variance_weight > 0 else 0.0
-    avg_cos_sim = total_cos_sim / total_batches if variance_weight > 0 else 0.0
+    avg_cov_loss = total_cov_loss / total_batches
+    has_reg = (variance_weight > 0 or covariance_weight > 0)
+    avg_feat_std = total_feat_std / total_batches if has_reg else 0.0
+    avg_cos_sim = total_cos_sim / total_batches if has_reg else 0.0
     
-    return avg_total_loss, avg_byol_loss, avg_var_loss, avg_feat_std, avg_cos_sim
+    return avg_total_loss, avg_byol_loss, avg_var_loss, avg_cov_loss, avg_feat_std, avg_cos_sim
 
 
 def validate_byol_epoch(model, dataloader, device, augmentation, verbose=True):

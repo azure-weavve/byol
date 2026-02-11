@@ -31,6 +31,7 @@ from utils.train_byol import (
 from utils.evaluation import evaluate_all, print_evaluation_results
 from utils.byol_monitor import BYOLMonitor, visualize_latent_space
 from utils.dataloader_utils import prepare_clean_data, create_dataloaders
+from utils.gpu_monitor import print_gpu_memory
 
 
 
@@ -177,6 +178,7 @@ def train_byol_wafer(config):
         wafer_size=(config['wafer_size'], config['wafer_size']),
         tau=config['tau_base']
     ).to(device)
+    print_gpu_memory("After Model Creation")
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -244,20 +246,22 @@ def train_byol_wafer(config):
 
     for epoch in range(start_epoch, config['epochs']):
         epoch_start_time = time.time()
+        print_gpu_memory("Before Training")
 
         # 🆕 Variance config 준비
         variance_config = {
             'type': config.get('variance_type', 'target_std_robust'),
             'target_std': config.get('variance_target_std', 1.0),
             'margin': config.get('variance_margin', 0.1),
-            'weight': config.get('variance_weight', 0.0)
+            'weight': config.get('variance_weight', 0.0),
+            'covariance_weight': config.get('covariance_weight', 0.0),  # 🆕
         }
 
         # Get current tau for EMA update
         tau = get_tau_schedule(epoch, config['epochs'], config['tau_base'], config['tau_max'])
 
         # Train
-        train_loss, byol_loss, var_loss, feat_std, avg_cos_sim = train_byol_epoch(
+        train_loss, byol_loss, var_loss, cov_loss, feat_std, avg_cos_sim = train_byol_epoch(
             model, train_loader, optimizer, device,
             tau=tau, augmentation=augmentation, epoch=epoch, variance_config=variance_config, verbose=False
         )
@@ -281,6 +285,9 @@ def train_byol_wafer(config):
             sample_features = model.get_embeddings(sample_batch, use_target=True)
 
             is_collapsed, collapse_info = detect_collapse(sample_features)
+        
+        if epoch == 0:
+            print_gpu_memory("After Training - First Epoch")
 
         # Log to monitor
         monitor.log_epoch(epoch, train_loss, val_loss, current_lr, tau)
@@ -288,7 +295,9 @@ def train_byol_wafer(config):
             epoch=epoch,
             byol_loss=byol_loss,
             variance_loss=var_loss,
+            covariance_loss=cov_loss,                                       # 🆕
             variance_weight=variance_config['weight'],
+            covariance_weight=variance_config.get('covariance_weight', 0.0),  # 🆕
             feature_std=feat_std,
             avg_cos_sim=avg_cos_sim,
             target_std=variance_config.get('target_std', 1.0)
@@ -353,7 +362,7 @@ def train_byol_wafer(config):
             break
 
         # Save plots periodically
-        if epoch == 0 or (epoch + 1) % 10 == 0:
+        if epoch == 0 or (epoch + 1) % config['save_frequency'] == 0:
             monitor.plot_training_curves()
             monitor.plot_evaluation_metrics()
             monitor.save_history()
@@ -367,6 +376,9 @@ def train_byol_wafer(config):
         model, val_loader, device, n_samples_invariance=200, log_dir=config['log_dir']
     )
     print_evaluation_results(eval_metrics)
+
+    # ✅ 추가: Final Evaluation 결과를 history에 저장
+    monitor.log_evaluation(epoch, eval_metrics)
 
     # Save final model
     save_path = os.path.join(config['save_dir'], 'final_model.pth')
@@ -421,7 +433,7 @@ def get_default_config(path):
 
         # Data parameters
         'wafer_size': 128,
-        'batch_size': 256,
+        'batch_size': 128,
 
         # Model
         'encoder_dim': 512,
@@ -453,12 +465,11 @@ def get_default_config(path):
         'gamma': 0.9,
         
         # Variance Regularization (Target Std)
-        'variance_config': {
-            'variance_type': 'target_std_robust',  # 'target_std' or 'target_std_robust'
-            'variance_target_std': 1.0,            # 목표 std
-            'variance_margin': 0.1,                # robust margin (0.9~1.1 허용)
-            'variance_weight': 0.2,                # loss weight
-        },
+        'variance_type': 'target_std_robust',  # 'target_std' or 'target_std_robust'
+        'variance_target_std': 1.0,            # 목표 std
+        'variance_margin': 0.1,                # robust margin (0.9~1.1 허용)
+        'variance_weight': 0.2,                # loss weight
+        'covariance_weight': 0.04,      # 🆕
 
         # Monitoring
         'eval_frequency': 5,

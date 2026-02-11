@@ -54,6 +54,8 @@ class BYOLMonitor:
                 'feature_std': [],
                 'avg_cos_sim': [],
                 'target_std': [],
+                'covariance_loss': [],      # 🆕
+                'covariance_weight': [],    # 🆕
                 # Collapse detection
                 'feat_std_collapse': [],
                 'avg_cos_sim_collapse': [],
@@ -74,7 +76,7 @@ class BYOLMonitor:
         self.history['tau'].append(tau)
     
     def log_variance_metrics(self, epoch, byol_loss, variance_loss, variance_weight,
-                            feature_std, avg_cos_sim, target_std=1.0):
+                            feature_std, avg_cos_sim, target_std=1.0, covariance_loss=0.0, covariance_weight=0.0):
         """
         🆕 Log variance regularization metrics
         
@@ -89,7 +91,9 @@ class BYOLMonitor:
         """
         self.history['byol_loss'].append(byol_loss)
         self.history['variance_loss'].append(variance_loss)
+        self.history['covariance_loss'].append(covariance_loss)      # 🆕
         self.history['variance_weight'].append(variance_weight)
+        self.history['covariance_weight'].append(covariance_weight)  # 🆕
         self.history['feature_std'].append(feature_std)
         self.history['avg_cos_sim'].append(avg_cos_sim)
         self.history['target_std'].append(target_std)
@@ -137,6 +141,9 @@ class BYOLMonitor:
         if self.history['byol_loss']:
             ax.plot(epochs, self.history['byol_loss'], label='BYOL Loss', linewidth=2, color='blue')
             ax.plot(epochs, self.history['variance_loss'], label='Variance Loss', linewidth=2, color='orange')
+            if self.history.get('covariance_loss') and any(v > 0 for v in self.history['covariance_loss']):
+                ax.plot(epochs, self.history['covariance_loss'], label='Covariance Loss',
+                       linewidth=2, color='green', linestyle='--')
             ax.set_xlabel('Epoch')
             ax.set_ylabel('Loss')
             ax.set_title('Loss Components')
