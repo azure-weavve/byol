@@ -190,46 +190,42 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
         
         # 2. Variance regularization
         if variance_weight > 0 or covariance_weight > 0:
-            with torch.no_grad():
-                model.encoder_online.eval()
-            
+            # gradient가 흐르는 상태에서 feature 추출
             features_1 = model.encoder_online(view1)
             features_2 = model.encoder_online(view2)
-            
-            model.encoder_online.train()
-            
             all_features = torch.cat([features_1, features_2], dim=0)
             
-            # Variance loss 선택
-            if variance_type == 'target_std':
-                var_loss, current_std = compute_variance_loss_target_std(
-                    all_features,
-                    target_std=variance_config.get('target_std', 1.0)
-                )
-            elif variance_type == 'target_std_robust':
-                var_loss, current_std = compute_variance_loss_robust(
-                    all_features,
-                    target_std=variance_config.get('target_std', 1.0),
-                    margin=variance_config.get('margin', 0.1)
-                )
+            # Variance loss (monitoring + 간접 regularization)
+            if variance_weight > 0:
+                if variance_type == 'target_std':
+                    var_loss, current_std = compute_variance_loss_target_std(
+                        all_features,
+                        target_std=variance_config.get('target_std', 1.0)
+                    )
+                elif variance_type == 'target_std_robust':
+                    var_loss, current_std = compute_variance_loss_robust(
+                        all_features,
+                        target_std=variance_config.get('target_std', 1.0),
+                        margin=variance_config.get('margin', 0.1)
+                    )
+                else:
+                    var_loss = compute_variance_loss(all_features)
+                    current_std = all_features.std(dim=0).mean().item()
             else:
-                # Original
-                var_loss = compute_variance_loss(all_features)
+                var_loss = torch.tensor(0.0, device=device)
                 current_std = all_features.std(dim=0).mean().item()
             
-            # ✅ current_std를 그대로 사용!
             total_feat_std += current_std
-
-            # 🆕 Covariance loss
+            
+            # Covariance loss (gradient 필수!)
             if covariance_weight > 0:
                 cov_loss = compute_covariance_loss(all_features)
             else:
                 cov_loss = torch.tensor(0.0, device=device)
             
-            # Cosine similarity 계산
+            # Cosine similarity (monitoring용이므로 no_grad)
             with torch.no_grad():
                 normalized = all_features / (all_features.norm(dim=1, keepdim=True) + 1e-8)
-                # Efficient sampling for large batches
                 n_samples = min(100, all_features.size(0))
                 if n_samples >= 2:
                     indices = torch.randperm(all_features.size(0))[:n_samples]
@@ -239,7 +235,6 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
                     avg_cos_sim_batch = cos_sim_matrix[mask].mean().item()
                 else:
                     avg_cos_sim_batch = 0.0
-                
                 total_cos_sim += avg_cos_sim_batch
             
             # Total loss

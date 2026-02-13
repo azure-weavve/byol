@@ -119,6 +119,28 @@ def load_wafer_data(data_configs, use_filter=True, use_density_aware=False, use_
 
     return wafer_maps, labels, info
 
+# 🆕 Composite score 계산 함수
+def compute_composite_score(eval_metrics, avg_cos_sim, weights):
+    """
+    Composite score = silhouette * w1 + rotation_inv * w2 + avg_cos_sim * w3
+    (w3는 음수이므로 cos_sim이 높으면 페널티)
+    """
+    clustering = eval_metrics.get('clustering', {})
+    rotation = eval_metrics.get('rotation_invariance', {})
+
+    silhouette = clustering.get('silhouette')
+    rotation_inv = rotation.get('avg_cosine_similarity')
+
+    # 하나라도 없으면 계산 불가
+    if silhouette is None or rotation_inv is None:
+        return None
+
+    score = (silhouette * weights.get('silhouette', 0.5)
+            + rotation_inv * weights.get('rotation_invariance', 0.3)
+            + avg_cos_sim * weights.get('avg_cos_sim', -0.2))
+
+    return score
+
 
 def train_byol_wafer(config):
     """
@@ -223,12 +245,13 @@ def train_byol_wafer(config):
     early_stopping = EarlyStopping(
         patience=config['early_stopping_patience'],
         min_delta=config['early_stopping_delta'],
-        mode='min'
+        mode=config['early_stopping_mode']
     )
 
     # Resume from checkpoint if specified
     start_epoch = 0
     best_val_loss = float('inf')
+    best_composite = -float('inf')  # 🆕 composite score 기준 best
 
     if config.get('resume_path') is not None and os.path.exists(config['resume_path']):
         print(f"\nResuming from checkpoint: {config['resume_path']}")
@@ -242,11 +265,10 @@ def train_byol_wafer(config):
     print(f"\nStarting training for {config['epochs']} epochs...")
     print("="*60)
 
-    best_val_loss = float('inf')
-
     for epoch in range(start_epoch, config['epochs']):
         epoch_start_time = time.time()
-        print_gpu_memory("Before Training")
+        if epoch == 0:
+            print_gpu_memory("Before Training")
 
         # 🆕 Variance config 준비
         variance_config = {
@@ -287,6 +309,7 @@ def train_byol_wafer(config):
             is_collapsed, collapse_info = detect_collapse(sample_features)
         
         if epoch == 0:
+            torch.cuda.reset_peak_memory_stats()
             print_gpu_memory("After Training - First Epoch")
 
         # Log to monitor
@@ -329,37 +352,63 @@ def train_byol_wafer(config):
             # Visualize latent space
             features, _ = extract_features(model, val_loader, device, use_target=True, verbose=False)
             visualize_latent_space(
-                features[:1000],  # Subsample for speed
+                features[:1000],
                 labels=cluster_labels[:1000] if cluster_labels is not None else None,
                 method='tsne',
                 save_path=os.path.join(config['log_dir'], f'latent_space_epoch_{epoch+1}.png'),
                 title=f'Latent Space (Epoch {epoch+1})'
             )
 
-        # Save checkpoint
+            # 🆕 Composite score 계산
+            composite_weights = config.get('composite_weights', {
+                'silhouette': 0.5, 'rotation_invariance': 0.3, 'avg_cos_sim': -0.2
+            })
+            current_composite = compute_composite_score(
+                eval_metrics, avg_cos_sim, composite_weights
+            )
+
+            if current_composite is not None:
+                print(f"  📊 Composite Score: {current_composite:.4f} (best: {best_composite:.4f})")
+
+                # Best model 저장 (composite 기준)
+                if current_composite > best_composite:
+                    best_composite = current_composite
+                    save_path = os.path.join(config['save_dir'], 'best_model.pth')
+                    save_checkpoint(
+                        model, optimizer, scheduler, epoch, val_loss, save_path,
+                        best_val_loss=best_val_loss,
+                        best_composite=best_composite,
+                        config=config
+                    )
+                    # 점수 구성요소도 출력
+                    sil = eval_metrics.get('clustering', {}).get('silhouette', 0)
+                    rot = eval_metrics.get('rotation_invariance', {}).get('avg_cosine_similarity', 0)
+                    print(f"  🏆 Best model saved! composite={current_composite:.4f} "
+                        f"(sil={sil:.3f}, rot={rot:.3f}, cos={avg_cos_sim:.3f})")
+
+                # Early stopping 체크
+                if early_stopping(current_composite):
+                    print(f"\n⏹ Early stopping at epoch {epoch+1} "
+                        f"(composite score not improving for {config['early_stopping_patience']} evaluations)")
+                    break
+
+        # Val loss best 별도 추적 (참고용, 저장은 안 함)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_path = os.path.join(config['save_dir'], 'best_model.pth')
-            save_checkpoint(
-                model, optimizer, scheduler, epoch, val_loss, save_path,
-                best_val_loss=best_val_loss,  # 🔴 추가
-                config=config
-            )
-            print(f"Best model saved (val_loss: {val_loss:.6f})")
 
-        # Regular checkpoint
+        # Regular checkpoint (기존과 동일)
         if epoch == 0 or (epoch + 1) % config['save_frequency'] == 0:
             save_path = os.path.join(config['save_dir'], f'checkpoint_epoch_{epoch+1}.pth')
             save_checkpoint(
                 model, optimizer, scheduler, epoch, val_loss, save_path,
-                best_val_loss=best_val_loss,  # 🔴 추가
+                best_val_loss=best_val_loss,
                 config=config
             )
 
-        # Early stopping
-        if early_stopping(val_loss):
-            print(f"\nEarly stopping triggered at epoch {epoch+1}")
-            break
+        # # ❌ 기존 val_loss 기반 early stopping 제거
+        # if early_stopping(val_loss):
+        #     print(f"\nEarly stopping triggered at epoch {epoch+1}")
+        #     break
 
         # Save plots periodically
         if epoch == 0 or (epoch + 1) % config['save_frequency'] == 0:
@@ -469,22 +518,30 @@ def get_default_config(path):
         'variance_target_std': 1.0,            # 목표 std
         'variance_margin': 0.1,                # robust margin (0.9~1.1 허용)
         'variance_weight': 0.2,                # loss weight
-        'covariance_weight': 0.04,      # 🆕
+        'covariance_weight': 0.1,              # 🆕 (0.04 -> 0.1)
+
+        # Composite score weights (early stopping & best model 기준)
+        'composite_weights': {
+            'silhouette': 0.5,
+            'rotation_invariance': 0.3,
+            'avg_cos_sim': -0.2,  # 음수 = 낮을수록 좋음
+        },
 
         # Monitoring
         'eval_frequency': 5,
         'save_frequency': 5,
 
         # Early stopping
-        'early_stopping_patience': 15,
-        'early_stopping_delta': 0.001,
+        'early_stopping_patience': 6,          # eval_frequence * early_stopping_patience로 실제 early_stopping 적용
+        'early_stopping_delta': 0.01,
+        'early_stopping_mode': 'max',          # min, max 중 하나
 
         # Paths
         'save_dir': 'checkpoints',
         'log_dir': 'logs',
         'resume_path': None
         #'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/best_model.pth"
-        #'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/checkpoint_epoch_20.pth"
+        #'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/checkpoint_epoch_10.pth"
     }
 
     return config
