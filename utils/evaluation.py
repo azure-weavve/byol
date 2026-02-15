@@ -18,6 +18,157 @@ from sklearn.cluster import DBSCAN
 
 
 
+def evaluate_knn_consistency(model, dataloader, device, all_features=None,
+                              n_samples=500, k=20):
+    """
+    kNN Consistency 평가: C4 augmented 버전이 원본의 k-NN에 포함되는 비율
+
+    원리:
+        - N개 샘플에 대해 C4 회전(90°, 180°, 270°) 적용 → 각 embedding 추출
+        - 전체 validation set feature pool에서 원본의 k-NN 검색
+        - k-NN 안에 C4 변환 버전이 포함된 비율 = consistency
+
+    Args:
+        model: BYOL model
+        dataloader: validation dataloader
+        device: torch device
+        all_features: 미리 추출한 전체 feature (None이면 내부에서 추출)
+        n_samples: 평가에 사용할 샘플 수 (전체에서 샘플링)
+        k: k-NN의 k 값
+
+    Returns:
+        metrics: dict with knn_consistency and details
+    """
+    model.eval()
+
+    # 1. 전체 feature pool 준비 (이미 추출된 것 재활용)
+    if all_features is None:
+        from utils.train_byol import extract_features
+        all_features, _ = extract_features(model, dataloader, device,
+                                            use_target=True, verbose=False)
+
+    # numpy로 변환 (이미 numpy면 그대로)
+    if isinstance(all_features, torch.Tensor):
+        all_features_np = all_features.cpu().numpy()
+    else:
+        all_features_np = all_features
+
+    N_total = all_features_np.shape[0]
+
+    # 2. 평가용 샘플 추출 (dataloader에서 원본 이미지 필요)
+    sample_images = []
+    sample_indices = []
+
+    # 랜덤 인덱스 선택
+    selected_indices = np.random.permutation(N_total)[:n_samples]
+    selected_set = set(selected_indices.tolist())
+
+    # dataloader에서 해당 인덱스의 이미지 수집
+    current_idx = 0
+    for data in dataloader:
+        if isinstance(data, (list, tuple)):
+            if len(data) == 4:
+                images = data[0]
+            else:
+                images = data[0] if len(data) > 0 else data
+        else:
+            images = data
+
+        batch_size = images.size(0)
+        for i in range(batch_size):
+            global_idx = current_idx + i
+            if global_idx in selected_set:
+                sample_images.append(images[i])
+                sample_indices.append(global_idx)
+
+        current_idx += batch_size
+
+        if len(sample_images) >= n_samples:
+            break
+
+    actual_n_samples = len(sample_images)
+    if actual_n_samples == 0:
+        print("⚠️  No samples collected for kNN consistency evaluation")
+        return {'knn_consistency': 0.0, 'n_samples': 0}
+
+    # 3. 전체 feature pool의 L2 norm 미리 계산 (cosine distance용)
+    #    euclidean distance 사용
+    #    sklearn 없이 직접 계산 (PyTorch 1.4.0 호환)
+
+    # 4. 각 샘플에 대해 C4 변환 후 kNN consistency 계산
+    consistencies = []
+
+    with torch.no_grad():
+        for idx, (img, global_idx) in enumerate(zip(sample_images, sample_indices)):
+            # C4 회전 적용 (90°, 180°, 270° - 0°는 원본이므로 제외)
+            rotated_images = []
+            for rot_k in [1, 2, 3]:  # 90°, 180°, 270°
+                rotated = torch.rot90(img, k=rot_k, dims=(-2, -1))
+                rotated_images.append(rotated)
+
+            # 회전된 이미지들의 embedding 추출
+            rotated_batch = torch.stack(rotated_images).to(device)  # (3, C, H, W)
+            rotated_embeddings = model.get_embeddings(rotated_batch,
+                                                       use_target=True)  # (3, D)
+            rotated_embeddings_np = rotated_embeddings.cpu().numpy()
+
+            # 원본 feature (이미 추출된 all_features에서 가져옴)
+            original_feature = all_features_np[global_idx]  # (D,)
+
+            # 원본의 k-NN 검색 (euclidean distance)
+            # all_features_np: (N_total, D), original_feature: (D,)
+            diffs = all_features_np - original_feature[np.newaxis, :]  # (N_total, D)
+            distances = np.sqrt(np.sum(diffs ** 2, axis=1))  # (N_total,)
+
+            # 자기 자신 제외하고 k개 선택
+            distances[global_idx] = float('inf')
+            knn_indices = np.argpartition(distances, k)[:k]  # top-k 인덱스
+            knn_features = all_features_np[knn_indices]  # (k, D)
+
+            # 각 회전 embedding이 k-NN 안에 있는지 확인
+            # "있다" = k-NN 중 가장 가까운 것과의 거리가 threshold 이하
+            # 대신 더 직접적인 방법: 회전 embedding과 k-NN feature들 간 최소 거리
+            # → 원본과 k-NN의 최대 거리보다 작으면 "포함"으로 판정
+            knn_max_dist = np.max(distances[knn_indices])
+
+            n_found = 0
+            for rot_emb in rotated_embeddings_np:
+                # 회전 embedding과 전체 feature pool 간 거리
+                rot_diffs = all_features_np - rot_emb[np.newaxis, :]
+                rot_distances = np.sqrt(np.sum(rot_diffs ** 2, axis=1))
+
+                # 이 회전 embedding의 가장 가까운 이웃이 원본의 k-NN 안에 있는가?
+                # 또는 더 직접적으로: 이 회전 embedding이 원본의 k-NN 반경 안에 있는가?
+                rot_dist_to_original = np.sqrt(np.sum((rot_emb - original_feature) ** 2))
+                if rot_dist_to_original <= knn_max_dist:
+                    n_found += 1
+
+            consistency = n_found / 3.0  # C4에서 원본 제외 3개
+            consistencies.append(consistency)
+
+            if (idx + 1) % 100 == 0:
+                print(f"  kNN Consistency: {idx+1}/{actual_n_samples} samples processed, "
+                      f"running avg: {np.mean(consistencies):.4f}")
+
+    avg_consistency = np.mean(consistencies)
+    std_consistency = np.std(consistencies)
+
+    metrics = {
+        'knn_consistency': avg_consistency,
+        'knn_consistency_std': std_consistency,
+        'n_samples': actual_n_samples,
+        'k': k,
+        'perfect_consistency_ratio': np.mean([c == 1.0 for c in consistencies]),
+        'zero_consistency_ratio': np.mean([c == 0.0 for c in consistencies]),
+    }
+
+    print(f"\n  kNN Consistency: {avg_consistency:.4f} (±{std_consistency:.4f})")
+    print(f"  Perfect (3/3): {metrics['perfect_consistency_ratio']:.1%}")
+    print(f"  Zero (0/3): {metrics['zero_consistency_ratio']:.1%}")
+
+    return metrics
+
+
 def compute_pairwise_distances(features, metric='euclidean'):
     """
     Compute pairwise distances
@@ -452,11 +603,15 @@ def evaluate_cluster_consistency_d4(model, test_samples, device, min_cluster_siz
     return consistency_ratio
 
 
-def evaluate_all(model, dataloader, device, n_samples_invariance=100, log_dir='logs'):
+def evaluate_all(model, dataloader, device, n_samples_invariance=100, n_samples_knn=500, k_knn=20, log_dir='logs'):
     """
     Comprehensive evaluation with DBSCAN optimization
+    변경사항:
+    - knn_consistency 평가 추가
+    - rotation_invariance는 유지 (모니터링용, composite score에서만 제외)
     """
     from utils.train_byol import extract_features
+    import os
 
     print("Extracting features...")
     features, _ = extract_features(model, dataloader, device, use_target=True, verbose=False)
@@ -476,6 +631,7 @@ def evaluate_all(model, dataloader, device, n_samples_invariance=100, log_dir='l
     clustering_metrics, labels = evaluate_clustering(features, min_cluster_size=50)
 
     # Get test samples for rotation invariance
+    # ===== 기존 rotation invariance (모니터링용 유지) =====
     print("\nEvaluating rotation invariance...")
     test_samples = []
     for data in dataloader:
@@ -494,12 +650,22 @@ def evaluate_all(model, dataloader, device, n_samples_invariance=100, log_dir='l
     invariance_metrics = evaluate_rotation_invariance(model, test_samples, device)
     consistency_ratio = evaluate_cluster_consistency_d4(model, test_samples, device)
 
+    # ===== 🆕 kNN Consistency 추가 =====
+    print("\nEvaluating kNN consistency...")
+    knn_metrics = evaluate_knn_consistency(
+        model, dataloader, device,
+        all_features=features,
+        n_samples=n_samples_knn,
+        k=k_knn
+    )
+
     # Combine all metrics
     all_metrics = {
         'retrieval': retrieval_metrics,
         'clustering': clustering_metrics,
         'rotation_invariance': invariance_metrics,
-        'cluster_consistency_d4': consistency_ratio
+        'cluster_consistency_d4': consistency_ratio,
+        'knn_consistency': knn_metrics,  # 🆕
     }
 
     return all_metrics, labels

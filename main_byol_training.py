@@ -124,20 +124,29 @@ def compute_composite_score(eval_metrics, avg_cos_sim, weights):
     """
     Composite score = silhouette * w1 + rotation_inv * w2 + avg_cos_sim * w3
     (w3는 음수이므로 cos_sim이 높으면 페널티)
+
+    변경된 Composite score:
+    knn_consistency * 0.5 + silhouette * 0.3 + avg_cos_sim * (-0.2)
+
+    기존 rotation_invariance 제거, knn_consistency 추가
     """
     clustering = eval_metrics.get('clustering', {})
-    rotation = eval_metrics.get('rotation_invariance', {})
+    knn = eval_metrics.get('knn_consistency', {})
 
     silhouette = clustering.get('silhouette')
-    rotation_inv = rotation.get('avg_cosine_similarity')
+    knn_consistency = knn.get('knn_consistency')
 
     # 하나라도 없으면 계산 불가
-    if silhouette is None or rotation_inv is None:
+    if silhouette is None or knn_consistency is None:
         return None
 
-    score = (silhouette * weights.get('silhouette', 0.5)
-            + rotation_inv * weights.get('rotation_invariance', 0.3)
-            + avg_cos_sim * weights.get('avg_cos_sim', -0.2))
+    # 하나라도 없으면 계산 불가
+    if silhouette is None or knn_consistency is None:
+        return None
+
+    score = (knn_consistency * weights.get('knn_consistency', 0.5)
+             + silhouette * weights.get('silhouette', 0.3)
+             + avg_cos_sim * weights.get('avg_cos_sim', -0.2))
 
     return score
 
@@ -343,7 +352,7 @@ def train_byol_wafer(config):
         if monitor.should_evaluate(epoch):
             print(f"\nPerforming evaluation at epoch {epoch+1}...")
             eval_metrics, cluster_labels = evaluate_all(
-                model, val_loader, device, n_samples_invariance=100, log_dir=config['log_dir']
+                model, val_loader, device, n_samples_invariance=100, k_knn=config['k_knn'], log_dir=config['log_dir']
             )
             print_evaluation_results(eval_metrics)
 
@@ -422,7 +431,7 @@ def train_byol_wafer(config):
     print("="*60)
 
     eval_metrics, cluster_labels = evaluate_all(
-        model, val_loader, device, n_samples_invariance=200, log_dir=config['log_dir']
+        model, val_loader, device, n_samples_invariance=200, k_knn=config['k_knn'], log_dir=config['log_dir']
     )
     print_evaluation_results(eval_metrics)
 
@@ -522,10 +531,13 @@ def get_default_config(path):
 
         # Composite score weights (early stopping & best model 기준)
         'composite_weights': {
-            'silhouette': 0.5,
-            'rotation_invariance': 0.3,
+            'knn_consistency': 0.5,
+            'silhouette': 0.3,
             'avg_cos_sim': -0.2,  # 음수 = 낮을수록 좋음
         },
+
+        # K in KNN
+        'k_knn': 20,
 
         # Monitoring
         'eval_frequency': 5,
