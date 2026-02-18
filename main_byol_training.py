@@ -178,6 +178,14 @@ def train_byol_wafer(config):
 
     if wafer_maps is None or len(wafer_maps) == 0:
         raise ValueError("Failed to load data. Please check your data_configs paths.")
+    
+    # ✅ Auto-detect input channels
+    n_channels = wafer_maps[0].shape[0]  # (C, H, W)
+    # Safety check
+    for i in range(min(10, len(wafer_maps))):
+        assert wafer_maps[i].shape[0] == n_channels, \
+            f"Channel mismatch at index {i}: {wafer_maps[i].shape[0]} vs {n_channels}"
+    print(f"Detected input channels: {n_channels}")
 
     # Create dataloaders from real data
     # IMPORTANT: use_augmentation=False because BYOL applies augmentation in training loop
@@ -200,6 +208,7 @@ def train_byol_wafer(config):
     # Create model
     print("\nCreating BYOL model...")
     model = BYOL(
+        input_channels=n_channels,  # ✅ 추가
         encoder_dim=config['encoder_dim'],
         projector_hidden=config['projector_hidden'],
         projector_out=config['projector_out'],
