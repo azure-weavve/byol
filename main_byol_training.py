@@ -370,7 +370,7 @@ def train_byol_wafer(config):
 
             # 🆕 Composite score 계산
             composite_weights = config.get('composite_weights', {
-                'silhouette': 0.5, 'rotation_invariance': 0.3, 'avg_cos_sim': -0.2
+                'knn_consistency': 0.5, 'silhouette': 0.3, 'avg_cos_sim': -0.2
             })
             current_composite = compute_composite_score(
                 eval_metrics, avg_cos_sim, composite_weights

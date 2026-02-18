@@ -510,19 +510,23 @@ def evaluate_rotation_invariance(model, test_samples, device, metric='cosine'):
         for i in range(test_samples.size(0)):
             sample = test_samples[i]  # (1, H, W)
 
-            # Get all 8 D4 transformations
-            d4_transforms = D4Transform.get_all_transforms(sample)
-            d4_batch = torch.stack(d4_transforms).to(device)  # (8, 1, H, W)
+            # Get all 8 D4 transformations -> C4
+            # d4_transforms = D4Transform.get_all_transforms(sample)
+            # d4_batch = torch.stack(d4_transforms).to(device)  # (8, 1, H, W)
+            c4_transforms = D4Transform.get_c4_transforms(sample)
+            c4_batch = torch.stack(c4_transforms).to(device)  # (4, C, H, W)
 
             # Extract embeddings
-            embeddings = model.get_embeddings(d4_batch, use_target=True)  # (8, D)
+            # embeddings = model.get_embeddings(d4_batch, use_target=True)  # (8, D)
+            embeddings = model.get_embeddings(c4_batch, use_target=True)  # (4, D)
 
             # Compute pairwise cosine similarities within D4 group
             embeddings_norm = embeddings / (embeddings.norm(dim=1, keepdim=True) + 1e-8)
             cos_sim_matrix = torch.mm(embeddings_norm, embeddings_norm.t())
 
             # Average cosine similarity (excluding diagonal)
-            mask = ~torch.eye(8, dtype=torch.bool, device=device)
+            # mask = ~torch.eye(8, dtype=torch.bool, device=device)
+            mask = ~torch.eye(4, dtype=torch.bool, device=device)
             avg_cos_sim = cos_sim_matrix[mask].mean().item()
             all_cos_sims.append(avg_cos_sim)
 
@@ -574,7 +578,8 @@ def evaluate_cluster_consistency_d4(model, test_samples, device, min_cluster_siz
             embeddings = model.get_embeddings(d4_batch, use_target=True)
 
             all_embeddings.append(embeddings.cpu())
-            group_ids.extend([i] * 8)  # Group ID for each transformation
+            # group_ids.extend([i] * 8)  # Group ID for each transformation (D4)
+            group_ids.extend([i] * 4)  # Group ID for each transformation (C4)
 
     # Concatenate all embeddings
     all_embeddings = torch.cat(all_embeddings, dim=0)  # (N*8, D)
@@ -591,7 +596,8 @@ def evaluate_cluster_consistency_d4(model, test_samples, device, min_cluster_siz
 
     for i in range(n_samples):
         # Get cluster labels for this D4 group
-        group_labels = cluster_labels[i*8:(i+1)*8]
+        # group_labels = cluster_labels[i*8:(i+1)*8] # D4
+        group_labels = cluster_labels[i*4:(i+1)*4] # C4
 
         # Check if all in same cluster (and not noise)
         unique_labels = np.unique(group_labels)

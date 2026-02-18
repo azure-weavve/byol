@@ -107,6 +107,17 @@ class D4Transform:
             list of 8 transformed tensors
         """
         return [D4Transform.apply(x, i) for i in range(8)]
+    
+    @staticmethod
+    def random_c4_transform(x):
+        """C4 only (rotation without reflection)"""
+        transform_id = random.randint(0, 3)  # 0~3만
+        return D4Transform.apply(x, transform_id), transform_id
+    
+    @staticmethod
+    def get_c4_transforms(x):
+        """Get 4 C4 transforms only"""
+        return [D4Transform.apply(x, i) for i in range(4)]
 
 
 class WaferAugmentation:
@@ -317,7 +328,8 @@ class BYOLAugmentation:
                  noise_std=0.02,
                  erase_prob=0.1,
                  erase_scale=(0.02, 0.1),
-                 small_rotation_deg=5):
+                 small_rotation_deg=5,
+                 use_c4_only=True):
         """
         Args:
             use_d4: use D4 transformations (CRITICAL!)
@@ -354,7 +366,10 @@ class BYOLAugmentation:
         # View 1
         view1 = x.clone()
         if self.use_d4:
-            view1, _ = D4Transform.random_transform(view1)
+            if self.use_c4_only:
+                view1, _ = D4Transform.random_c4_transform(view1)
+            else:
+                view1, _ = D4Transform.random_transform(view1)
         view1 = self.wafer_aug(
             view1,
             use_crop=self.use_crop,
@@ -366,7 +381,10 @@ class BYOLAugmentation:
         # View 2 (different transformation)
         view2 = x.clone()
         if self.use_d4:
-            view2, _ = D4Transform.random_transform(view2)
+            if self.use_c4_only:
+                view2, _ = D4Transform.random_c4_transform(view2)
+            else:
+                view2, _ = D4Transform.random_transform(view2)
         view2 = self.wafer_aug(
             view2,
             use_crop=self.use_crop,
