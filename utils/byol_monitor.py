@@ -64,7 +64,8 @@ class BYOLMonitor:
                 'silhouette': [],
                 'n_clusters': [],
                 'noise_ratio': [],
-                'rotation_invariance': []
+                'rotation_invariance': [],
+                'knn_consistency': [],
             }
     
     def log_epoch(self, epoch, train_loss, val_loss, lr, tau):
@@ -108,13 +109,13 @@ class BYOLMonitor:
         """Log evaluation metrics"""
         clustering = metrics.get('clustering', {})
         rotation = metrics.get('rotation_invariance', {})
+        knn = metrics.get('knn_consistency', {}) # ✅ 추가
         
         self.history['silhouette'].append(clustering.get('silhouette'))
         self.history['n_clusters'].append(clustering.get('n_clusters'))
         self.history['noise_ratio'].append(clustering.get('noise_ratio'))
-        self.history['rotation_invariance'].append(
-            rotation.get('avg_cosine_similarity')
-        )
+        self.history['rotation_invariance'].append(rotation.get('avg_cosine_similarity'))
+        self.history['knn_consistency'].append(knn.get('knn_consistency'))
     
     def should_evaluate(self, epoch):
         """Check if should perform evaluation"""

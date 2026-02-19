@@ -95,7 +95,7 @@ class TrainingSummary:
         # Interval로 샘플링
         summary_data = []
         
-        for epoch_idx in range(0, len(epochs), interval):
+        for idx, epoch_idx in enumerate(range(0, len(epochs), interval)):
             if epoch_idx >= len(epochs):
                 break
             
@@ -111,16 +111,20 @@ class TrainingSummary:
             }
             
             # 🔹 Evaluation metrics: 가장 가까운 평가 결과 매칭
-            sil_value = find_closest_value(silhouette, epoch)
+            # sil_value = find_closest_value(silhouette, epoch)
+            sil_value = silhouette[idx]
             row['Silhouette'] = f"{sil_value:.4f}" if sil_value is not None else "N/A"
             
-            ncl_value = find_closest_value(n_clusters, epoch)
+            # ncl_value = find_closest_value(n_clusters, epoch)
+            ncl_value = n_clusters[idx]
             row['n_clusters'] = int(ncl_value) if ncl_value is not None else "N/A"
             
-            noise_value = find_closest_value(noise_ratio, epoch)
+            # noise_value = find_closest_value(noise_ratio, epoch)
+            noise_value = noise_ratio[idx]
             row['Noise %'] = f"{noise_value*100:.1f}%" if noise_value is not None else "N/A"
             
-            rot_value = find_closest_value(rotation_inv, epoch)
+            # rot_value = find_closest_value(rotation_inv, epoch)
+            rot_value = rotation_inv[idx]
             row['Rotation Inv'] = f"{rot_value:.4f}" if rot_value is not None else "N/A"
             
             summary_data.append(row)
@@ -139,16 +143,20 @@ class TrainingSummary:
             }
             
             # 🔹 Evaluation metrics: 가장 가까운 평가 결과 매칭
-            sil_value = find_closest_value(silhouette, epoch)
+            # sil_value = find_closest_value(silhouette, epoch)
+            sil_value = silhouette[idx]
             row['Silhouette'] = f"{sil_value:.4f}" if sil_value is not None else "N/A"
             
-            ncl_value = find_closest_value(n_clusters, epoch)
+            # ncl_value = find_closest_value(n_clusters, epoch)
+            ncl_value = n_clusters[idx]
             row['n_clusters'] = int(ncl_value) if ncl_value is not None else "N/A"
             
-            noise_value = find_closest_value(noise_ratio, epoch)
+            # noise_value = find_closest_value(noise_ratio, epoch)
+            noise_value = noise_ratio[idx]
             row['Noise %'] = f"{noise_value*100:.1f}%" if noise_value is not None else "N/A"
             
-            rot_value = find_closest_value(rotation_inv, epoch)
+            # rot_value = find_closest_value(rotation_inv, epoch)
+            rot_value = rotation_inv[idx]
             row['Rotation Inv'] = f"{rot_value:.4f}" if rot_value is not None else "N/A"
             
             summary_data.append(row)

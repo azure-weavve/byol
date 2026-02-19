@@ -344,6 +344,7 @@ class BYOLAugmentation:
         self.use_noise = use_noise
         self.use_erase = use_erase
         self.use_rotation = use_rotation
+        self.use_c4_only = use_c4_only
 
         self.wafer_aug = WaferAugmentation(
             crop_scale=crop_scale,

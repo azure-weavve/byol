@@ -130,7 +130,7 @@ class BYOL(nn.Module):
         ):
             target_params.data = tau * target_params.data + (1 - tau) * online_params.data
 
-    def forward(self, view1, view2):
+    def forward(self, view1, view2, return_projections=False):
         """
         Forward pass for training
         Args:
@@ -163,6 +163,11 @@ class BYOL(nn.Module):
 
         # === Compute symmetric loss ===
         loss = symmetric_byol_loss(pred1, proj2_target, pred2, proj1_target)
+
+        if return_projections:
+            encoder_features = torch.cat([feat1_online, feat2_online])
+            projector_features = torch.cat([proj1_online, proj2_online])
+            return loss, encoder_features, projector_features
         return loss
     
     def encode(self, x, use_target=False):

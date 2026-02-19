@@ -184,59 +184,56 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
 
         # Forward pass
         optimizer.zero_grad()
-        
-        # 1. BYOL loss
-        byol_loss = model(view1, view2)
-        
-        # 2. Variance regularization
-        if variance_weight > 0 or covariance_weight > 0:
-            # gradient가 흐르는 상태에서 feature 추출
-            features_1 = model.encoder_online(view1)
-            features_2 = model.encoder_online(view2)
-            all_features = torch.cat([features_1, features_2], dim=0)
-            
-            # Variance loss (monitoring + 간접 regularization)
+
+        # 1. BYOL loss (+ features for regularization)
+        if variance_weight >0 or covariance_weight > 0:
+            byol_loss, encoder_features, projector_features = model(
+                view1, view2, return_projections=True
+            )
+
+            # Variance loss — encoder output (512d)
             if variance_weight > 0:
                 if variance_type == 'target_std':
                     var_loss, current_std = compute_variance_loss_target_std(
-                        all_features,
+                        encoder_features, 
                         target_std=variance_config.get('target_std', 1.0)
                     )
                 elif variance_type == 'target_std_robust':
                     var_loss, current_std = compute_variance_loss_robust(
-                        all_features,
-                        target_std=variance_config.get('target_std', 1.0),
+                        encoder_features, 
+                        target_std=variance_config.get('target_std', 1.0), 
                         margin=variance_config.get('margin', 0.1)
                     )
                 else:
-                    var_loss = compute_variance_loss(all_features)
-                    current_std = all_features.std(dim=0).mean().item()
+                    var_loss = compute_variance_loss(encoder_features)
+                    current_std = encoder_features.std(dim=0).mean().item()
             else:
                 var_loss = torch.tensor(0.0, device=device)
-                current_std = all_features.std(dim=0).mean().item()
+                current_std = encoder_features.std(dim=0).mean().item()
             
             total_feat_std += current_std
-            
-            # Covariance loss (gradient 필수!)
+
+            # Covariance loss — projector output (256d)
             if covariance_weight > 0:
-                cov_loss = compute_covariance_loss(all_features)
-            else:
+                cov_loss = compute_covariance_loss(projector_features)
+            else: 
                 cov_loss = torch.tensor(0.0, device=device)
-            
-            # Cosine similarity (monitoring용이므로 no_grad)
-            with torch.no_grad():
-                normalized = all_features / (all_features.norm(dim=1, keepdim=True) + 1e-8)
-                n_samples = min(100, all_features.size(0))
-                if n_samples >= 2:
-                    indices = torch.randperm(all_features.size(0))[:n_samples]
-                    sample_features = normalized[indices]
-                    cos_sim_matrix = torch.mm(sample_features, sample_features.T)
-                    mask = ~torch.eye(n_samples, dtype=torch.bool, device=device)
-                    avg_cos_sim_batch = cos_sim_matrix[mask].mean().item()
-                else:
-                    avg_cos_sim_batch = 0.0
+
+            # Cosine similarity (monitoring용)
+            with torch.no_grad(): 
+                normalized = encoder_features / (encoder_features.norm(dim=1, keepdim=True) + 1e-8) 
+                n_samples = min(100, encoder_features.size(0))
+                
+                if n_samples >= 2: 
+                    indices = torch.randperm(encoder_features.size(0))[:n_samples] 
+                    sample_features = normalized[indices] 
+                    cos_sim_matrix = torch.mm(sample_features, sample_features.T) 
+                    mask = ~torch.eye(n_samples, dtype=torch.bool, device=device) 
+                    avg_cos_sim_batch = cos_sim_matrix[mask].mean().item() 
+                else: 
+                    avg_cos_sim_batch = 0.0 
                 total_cos_sim += avg_cos_sim_batch
-            
+
             # Total loss
             total_loss_batch = byol_loss + variance_weight * var_loss + covariance_weight * cov_loss
         else:
