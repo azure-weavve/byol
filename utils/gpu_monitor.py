@@ -1,5 +1,5 @@
 import torch
-import subprocess
+
 
 def get_gpu_memory_usage():
     """
@@ -10,16 +10,20 @@ def get_gpu_memory_usage():
         allocated = torch.cuda.memory_allocated() / 1024**2  # MB
         # PyTorch가 예약한 메모리
         reserved = torch.cuda.memory_reserved() / 1024**2  # MB
+        # 최대 할당 메모리 (reset 이후 peak)
+        peak = torch.cuda.max_memory_allocated() / 1024**2  # MB
         # 전체 GPU 메모리
         total = torch.cuda.get_device_properties(0).total_memory / 1024**2  # MB
         
         return {
             'allocated_mb': allocated,
             'reserved_mb': reserved,
+            'peak_mb': peak,
             'total_mb': total,
             'free_mb': total - allocated
         }
     return None
+
 
 def print_gpu_memory(stage_name):
     """
@@ -30,9 +34,27 @@ def print_gpu_memory(stage_name):
         print(f"\n{'='*60}")
         print(f"GPU Memory [{stage_name}]")
         print(f"{'='*60}")
-        print(f"Allocated: {mem['allocated_mb']:.2f} MB ({mem['allocated_mb']/1024:.2f} GB)")
-        print(f"Reserved:  {mem['reserved_mb']:.2f} MB ({mem['reserved_mb']/1024:.2f} GB)")
-        print(f"Free:      {mem['free_mb']:.2f} MB ({mem['free_mb']/1024:.2f} GB)")
-        print(f"Total:     {mem['total_mb']:.2f} MB ({mem['total_mb']/1024:.2f} GB)")
-        print(f"Usage:     {(mem['allocated_mb']/mem['total_mb']*100):.2f}%")
+        print(f"Allocated: {mem['allocated_mb']:8.1f} MB ({mem['allocated_mb']/1024:.2f} GB)")
+        print(f"Peak:      {mem['peak_mb']:8.1f} MB ({mem['peak_mb']/1024:.2f} GB)")
+        print(f"Reserved:  {mem['reserved_mb']:8.1f} MB ({mem['reserved_mb']/1024:.2f} GB)")
+        print(f"Total:     {mem['total_mb']:8.1f} MB ({mem['total_mb']/1024:.2f} GB)")
+        print(f"Usage:     {(mem['allocated_mb']/mem['total_mb']*100):.1f}% (Peak: {(mem['peak_mb']/mem['total_mb']*100):.1f}%)")
         print(f"{'='*60}\n")
+
+
+def reset_peak_stats():
+    """
+    Peak memory 카운터 리셋
+    측정 구간 시작 전에 호출
+    """
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def get_peak_memory_mb():
+    """
+    현재 peak memory를 MB로 반환 (간단 조회용)
+    """
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / 1024**2
+    return 0.0

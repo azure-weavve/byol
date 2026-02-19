@@ -571,11 +571,11 @@ def evaluate_cluster_consistency_d4(model, test_samples, device, min_cluster_siz
             sample = test_samples[i]
 
             # Get all 8 D4 transformations
-            d4_transforms = D4Transform.get_all_transforms(sample)
-            d4_batch = torch.stack(d4_transforms).to(device)
+            c4_transforms = D4Transform.get_c4_transforms(sample)
+            c4_batch = torch.stack(c4_transforms).to(device)
 
             # Extract embeddings
-            embeddings = model.get_embeddings(d4_batch, use_target=True)
+            embeddings = model.get_embeddings(c4_batch, use_target=True)
 
             all_embeddings.append(embeddings.cpu())
             # group_ids.extend([i] * 8)  # Group ID for each transformation (D4)

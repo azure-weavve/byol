@@ -241,6 +241,9 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
             cov_loss = torch.tensor(0.0, device=device)  # 🆕
             current_std = 0.0
             avg_cos_sim_batch = 0.0
+            byol_loss, encoder_features, projector_features = model(
+                view1, view2, return_projections=True
+            )
             total_loss_batch = byol_loss
 
         # Backward pass
@@ -497,11 +500,12 @@ def load_checkpoint(model, optimizer, scheduler, filepath, device):
     epoch = checkpoint['epoch']
     loss = checkpoint['loss']
     best_val_loss = checkpoint.get('best_val_loss', float('inf'))  # 🔴 추가
+    best_composite = checkpoint.get('best_composite', -float('inf'))  # 추가
 
     print(f"Checkpoint loaded from {filepath}")
-    print(f"Resuming from epoch {epoch+1}, loss: {loss:.4f}, best_val_loss: {best_val_loss:.4f}")
+    print(f"Resuming from epoch {epoch+1}, loss: {loss:.4f}, best_val_loss: {best_val_loss:.4f}, best_composite: {best_composite:.4f}")
 
-    return epoch, loss, best_val_loss  # 🔴 3개 반환
+    return epoch, loss, best_val_loss, best_composite  # 4개 반환
 
 
 class EarlyStopping:

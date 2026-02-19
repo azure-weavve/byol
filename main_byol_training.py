@@ -31,7 +31,7 @@ from utils.train_byol import (
 from utils.evaluation import evaluate_all, print_evaluation_results
 from utils.byol_monitor import BYOLMonitor, visualize_latent_space
 from utils.dataloader_utils import prepare_clean_data, create_dataloaders
-from utils.gpu_monitor import print_gpu_memory
+from utils.gpu_monitor import print_gpu_memory, reset_peak_stats, get_peak_memory_mb
 
 
 
@@ -135,10 +135,6 @@ def compute_composite_score(eval_metrics, avg_cos_sim, weights):
 
     silhouette = clustering.get('silhouette')
     knn_consistency = knn.get('knn_consistency')
-
-    # 하나라도 없으면 계산 불가
-    if silhouette is None or knn_consistency is None:
-        return None
 
     # 하나라도 없으면 계산 불가
     if silhouette is None or knn_consistency is None:
@@ -273,7 +269,7 @@ def train_byol_wafer(config):
 
     if config.get('resume_path') is not None and os.path.exists(config['resume_path']):
         print(f"\nResuming from checkpoint: {config['resume_path']}")
-        start_epoch, resumed_loss, best_val_loss = load_checkpoint(
+        start_epoch, resumed_loss, best_val_loss, best_composite = load_checkpoint(
             model, optimizer, scheduler, config['resume_path'], device
         )
         start_epoch += 1
@@ -283,9 +279,12 @@ def train_byol_wafer(config):
     print(f"\nStarting training for {config['epochs']} epochs...")
     print("="*60)
 
+    # Peak memory 측정 시작
+    reset_peak_stats()
+
     for epoch in range(start_epoch, config['epochs']):
         epoch_start_time = time.time()
-        if epoch == 0:
+        if epoch == start_epoch:
             print_gpu_memory("Before Training")
 
         # 🆕 Variance config 준비
@@ -326,9 +325,8 @@ def train_byol_wafer(config):
 
             is_collapsed, collapse_info = detect_collapse(sample_features)
         
-        if epoch == 0:
-            torch.cuda.reset_peak_memory_stats()
-            print_gpu_memory("After Training - First Epoch")
+        if epoch == start_epoch:
+            print_gpu_memory("After First Epoch (Peak = Max Training Memory)")
 
         # Log to monitor
         monitor.log_epoch(epoch, train_loss, val_loss, current_lr, tau)
@@ -366,6 +364,10 @@ def train_byol_wafer(config):
             print_evaluation_results(eval_metrics)
 
             monitor.log_evaluation(epoch, eval_metrics)
+
+            # 첫 evaluation 후 peak memory 출력 (evaluation이 train보다 메모리를 더 쓸 수 있음)
+            if epoch == start_epoch + config['eval_frequency'] - 1:
+                print_gpu_memory("After First Evaluation (Overall Peak)")
 
             # Visualize latent space
             features, _ = extract_features(model, val_loader, device, use_target=True, verbose=False)
@@ -505,7 +507,7 @@ def get_default_config(path):
         # Model
         'encoder_dim': 512,
         'projector_hidden': 1024,
-        'projector_out': 512,
+        'projector_out': 256,
         'predictor_hidden': 1024,
         'use_radial_encoding': True,
         'use_attention': True,

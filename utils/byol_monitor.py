@@ -289,10 +289,58 @@ class BYOLMonitor:
         
         plt.close()
     
-    def plot_evaluation_metrics(self):
-        """Plot evaluation metrics"""
-        # ... 기존 코드 유지 ...
-        pass  # 기존 구현 그대로
+    def plot_evaluation_metrics(self, save_path=None):
+        """
+        Plot evaluation metrics over time
+        
+        ✅ 재개 학습 시 이전 데이터 + 현재 데이터 함께 표시
+
+        Args:
+            save_path: path to save plot
+        """
+        if save_path is None:
+            save_path = os.path.join(self.log_dir, 'evaluation_metrics.png')
+
+        # Find evaluation metrics
+        eval_keys = [k for k in self.history.keys() 
+                     if k.startswith(('retrieval_', 'clustering_', 'rotation_'))]
+
+        if len(eval_keys) == 0:
+            print("ℹ️  No evaluation metrics to plot")
+            return
+
+        # Create subplots
+        n_metrics = len(eval_keys)
+        n_cols = 3
+        n_rows = (n_metrics + n_cols - 1) // n_cols
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 5*n_rows))
+        axes = axes.flatten() if n_rows > 1 else [axes] if n_cols == 1 else axes
+
+        for i, key in enumerate(eval_keys):
+            if i >= len(axes):
+                break
+
+            data = self.history[key]
+            if len(data) > 0:
+                epochs, values = zip(*data)
+                axes[i].plot(epochs, values, marker='o', linewidth=2, color='#1f77b4')
+                axes[i].set_xlabel('Epoch')
+                axes[i].set_ylabel('Value')
+                axes[i].set_title(key.replace('_', ' ').title() + ' (전체 학습 기록)')
+                axes[i].grid(True, alpha=0.3)
+
+        # Hide unused subplots
+        for i in range(len(eval_keys), len(axes)):
+            axes[i].axis('off')
+
+        plt.tight_layout()
+
+        if self.save_plots:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"✅ Evaluation metrics saved to {save_path}")
+
+        plt.close()
     
     def save_history(self):
         """Save history to JSON"""
