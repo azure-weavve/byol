@@ -546,7 +546,7 @@ def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128)
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=False,
-        drop_last=False
+        drop_last=True
     )
 
     valid_loader = DataLoader(
@@ -556,7 +556,7 @@ def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128)
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=False,
-        drop_last=False
+        drop_last=True
     )
 
     print(f"   Train 배치: {len(train_loader)}개 / Valid 배치: {len(valid_loader)}개")

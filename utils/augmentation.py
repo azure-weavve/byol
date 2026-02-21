@@ -107,13 +107,13 @@ class D4Transform:
             list of 8 transformed tensors
         """
         return [D4Transform.apply(x, i) for i in range(8)]
-    
+
     @staticmethod
     def random_c4_transform(x):
         """C4 only (rotation without reflection)"""
         transform_id = random.randint(0, 3)  # 0~3만
         return D4Transform.apply(x, transform_id), transform_id
-    
+
     @staticmethod
     def get_c4_transforms(x):
         """Get 4 C4 transforms only"""
@@ -129,6 +129,7 @@ class WaferAugmentation:
         - Gaussian noise
         - Random erasing (simulates missing defects)
         - Small rotation (±5°, in addition to D4)
+        - Defect dropout (simulates defect intensity variation)
     """
 
     def __init__(self,
@@ -277,6 +278,41 @@ class WaferAugmentation:
 
         return x_rotated
 
+    def defect_dropout(self, x, dropout_rate_range=(0.1, 0.5), n_spatial_channels=13):
+        """
+        Defect 픽셀을 확률적으로 제거하여 강도 변화에 대한 invariance 학습.
+        Spatial 채널(앞쪽 n_spatial_channels)에만 적용하고,
+        Radial positional encoding 채널(뒤쪽)은 건드리지 않음.
+
+        Args:
+            x: (C, H, W) tensor, binary wafer map
+            dropout_rate_range: (min_rate, max_rate) 범위에서 uniform sampling
+            n_spatial_channels: spatial 채널 수 (기본 13)
+                                 나머지 채널은 radial encoding으로 간주하여 dropout 미적용
+
+        Returns:
+            dropout이 적용된 tensor
+        """
+        dropout_rate = random.uniform(dropout_rate_range[0], dropout_rate_range[1])
+
+        x = x.clone()
+        C, H, W = x.shape
+
+        # 실제 spatial 채널 수 결정 (채널 수가 n_spatial_channels보다 적을 경우 대비)
+        n_spatial = min(n_spatial_channels, C)
+
+        spatial = x[:n_spatial]  # (n_spatial, H, W)
+
+        # drop_mask: (1, H, W) → spatial 채널 전체에 동일한 마스크 broadcast
+        # 채널마다 다른 마스크를 쓰면 같은 위치 defect가 채널별로 들쭉날쭉해짐
+        drop_mask = torch.rand(1, H, W, dtype=x.dtype, device=x.device) < dropout_rate
+
+        defect_mask = (spatial > 0.5)           # (n_spatial, H, W)
+        spatial[defect_mask & drop_mask] = 0    # broadcast: drop_mask (1,H,W) → (n_spatial,H,W)
+
+        x[:n_spatial] = spatial
+        return x
+
     def __call__(self, x, use_crop=True, use_noise=True, use_erase=True, use_rotation=False):
         """
         Apply augmentation pipeline
@@ -314,37 +350,49 @@ class BYOLAugmentation:
     BYOL two-view augmentation pipeline
 
     Creates two augmented views of the same image:
-        view1 = D4 + wafer_aug
-        view2 = D4 + wafer_aug (different transformation)
+        view1 = D4(C4) + defect_dropout
+        view2 = D4(C4) + defect_dropout (다른 랜덤 값)
     """
 
     def __init__(self,
                  use_d4=True,
-                 use_crop=True,
-                 use_noise=True,
-                 use_erase=True,
+                 use_c4_only=True,
+                 use_crop=False,
+                 use_noise=False,
+                 use_erase=False,
                  use_rotation=False,
+                 use_defect_dropout=True,
+                 defect_dropout_prob=0.5,
+                 defect_dropout_rate=(0.1, 0.5),
+                 n_spatial_channels=13,
                  crop_scale=(0.8, 1.0),
                  noise_std=0.02,
                  erase_prob=0.1,
                  erase_scale=(0.02, 0.1),
-                 small_rotation_deg=5,
-                 use_c4_only=True):
+                 small_rotation_deg=5):
         """
         Args:
-            use_d4: use D4 transformations (CRITICAL!)
-            use_crop: use random crop
-            use_noise: use Gaussian noise
-            use_erase: use random erasing
-            use_rotation: use small rotation
-            ... other parameters passed to WaferAugmentation
+            use_d4: D4 변환 사용 여부 (CRITICAL)
+            use_c4_only: True면 C4(회전만), False면 D4(회전+반사) 사용
+            use_crop: random crop 사용 여부 (wafer map에는 비권장)
+            use_noise: Gaussian noise 사용 여부 (binary map에는 비권장)
+            use_erase: random erase 사용 여부 (패턴 왜곡 우려로 비권장)
+            use_rotation: small rotation 사용 여부
+            use_defect_dropout: defect dropout 사용 여부
+            defect_dropout_prob: defect dropout 적용 확률 (view당)
+            defect_dropout_rate: (min, max) dropout rate range
+            n_spatial_channels: spatial 채널 수 (나머지는 radial encoding으로 간주)
         """
         self.use_d4 = use_d4
+        self.use_c4_only = use_c4_only
         self.use_crop = use_crop
         self.use_noise = use_noise
         self.use_erase = use_erase
         self.use_rotation = use_rotation
-        self.use_c4_only = use_c4_only
+        self.use_defect_dropout = use_defect_dropout
+        self.defect_dropout_prob = defect_dropout_prob
+        self.defect_dropout_rate = defect_dropout_rate
+        self.n_spatial_channels = n_spatial_channels
 
         self.wafer_aug = WaferAugmentation(
             crop_scale=crop_scale,
@@ -354,6 +402,44 @@ class BYOLAugmentation:
             small_rotation_deg=small_rotation_deg
         )
 
+    def _apply_single_view(self, x):
+        """
+        단일 view에 augmentation 적용
+
+        Args:
+            x: (C, H, W) tensor
+
+        Returns:
+            augmented tensor
+        """
+        view = x.clone()
+
+        # D4 / C4 rotation
+        if self.use_d4:
+            if self.use_c4_only:
+                view, _ = D4Transform.random_c4_transform(view)
+            else:
+                view, _ = D4Transform.random_transform(view)
+
+        # 기존 augmentation (기본 비활성화)
+        view = self.wafer_aug(
+            view,
+            use_crop=self.use_crop,
+            use_noise=self.use_noise,
+            use_erase=self.use_erase,
+            use_rotation=self.use_rotation
+        )
+
+        # Defect dropout (spatial 채널만)
+        if self.use_defect_dropout and random.random() < self.defect_dropout_prob:
+            view = self.wafer_aug.defect_dropout(
+                view,
+                dropout_rate_range=self.defect_dropout_rate,
+                n_spatial_channels=self.n_spatial_channels
+            )
+
+        return view
+
     def __call__(self, x):
         """
         Generate two augmented views
@@ -362,47 +448,20 @@ class BYOLAugmentation:
             x: (C, H, W) tensor
 
         Returns:
-            view1, view2: two augmented views
+            view1, view2: two augmented views (서로 독립적인 랜덤 변환)
         """
-        # View 1
-        view1 = x.clone()
-        if self.use_d4:
-            if self.use_c4_only:
-                view1, _ = D4Transform.random_c4_transform(view1)
-            else:
-                view1, _ = D4Transform.random_transform(view1)
-        view1 = self.wafer_aug(
-            view1,
-            use_crop=self.use_crop,
-            use_noise=self.use_noise,
-            use_erase=self.use_erase,
-            use_rotation=self.use_rotation
-        )
-
-        # View 2 (different transformation)
-        view2 = x.clone()
-        if self.use_d4:
-            if self.use_c4_only:
-                view2, _ = D4Transform.random_c4_transform(view2)
-            else:
-                view2, _ = D4Transform.random_transform(view2)
-        view2 = self.wafer_aug(
-            view2,
-            use_crop=self.use_crop,
-            use_noise=self.use_noise,
-            use_erase=self.use_erase,
-            use_rotation=self.use_rotation
-        )
-
+        view1 = self._apply_single_view(x)
+        view2 = self._apply_single_view(x)
         return view1, view2
 
 
-def get_byol_augmentation(augmentation_type='strong'):
+def get_byol_augmentation(augmentation_type='strong', n_spatial_channels=13):
     """
     Get BYOL augmentation pipeline
 
     Args:
         augmentation_type: 'strong', 'medium', or 'weak'
+        n_spatial_channels: spatial 채널 수 (모델 설정에 맞게 전달)
 
     Returns:
         BYOLAugmentation instance
@@ -410,33 +469,41 @@ def get_byol_augmentation(augmentation_type='strong'):
     if augmentation_type == 'strong':
         return BYOLAugmentation(
             use_d4=True,
-            use_crop=True,
-            use_noise=True,
-            use_erase=True,
+            use_c4_only=True,
+            use_crop=False,
+            use_noise=False,
+            use_erase=False,
             use_rotation=False,
-            crop_scale=(0.8, 1.0),
-            noise_std=0.02,
-            erase_prob=0.1
+            use_defect_dropout=True,
+            defect_dropout_prob=0.5,
+            defect_dropout_rate=(0.1, 0.5),
+            n_spatial_channels=n_spatial_channels,
         )
 
     elif augmentation_type == 'medium':
         return BYOLAugmentation(
             use_d4=True,
-            use_crop=True,
-            use_noise=True,
+            use_c4_only=True,
+            use_crop=False,
+            use_noise=False,
             use_erase=False,
             use_rotation=False,
-            crop_scale=(0.85, 1.0),
-            noise_std=0.01
+            use_defect_dropout=True,
+            defect_dropout_prob=0.3,
+            defect_dropout_rate=(0.1, 0.3),
+            n_spatial_channels=n_spatial_channels,
         )
 
     elif augmentation_type == 'weak':
         return BYOLAugmentation(
             use_d4=True,
+            use_c4_only=True,
             use_crop=False,
             use_noise=False,
             use_erase=False,
-            use_rotation=False
+            use_rotation=False,
+            use_defect_dropout=False,
+            n_spatial_channels=n_spatial_channels,
         )
 
     else:
@@ -447,38 +514,50 @@ def test_augmentation():
     """Test augmentation functions"""
     print("Testing augmentation...")
 
-    # Create sample wafer map
-    x = torch.rand(1, 128, 128)
+    # 29채널 (13 spatial + 16 radial) 테스트
+    C, H, W = 29, 128, 128
+    x = torch.zeros(C, H, W)
+    # spatial 채널에만 임의 defect 생성
+    x[:13] = (torch.rand(13, H, W) > 0.85).float()
 
     # Test D4 transformations
     print("\nTesting D4 transformations...")
     all_transforms = D4Transform.get_all_transforms(x)
     print(f"Generated {len(all_transforms)} D4 transformations")
 
-    # Test random D4
     x_transformed, transform_id = D4Transform.random_transform(x)
     print(f"Random D4 transform ID: {transform_id}")
     print(f"Transformed shape: {x_transformed.shape}")
 
-    # Test wafer augmentation
-    print("\nTesting wafer augmentation...")
+    # Test defect dropout (spatial only)
+    print("\nTesting defect dropout (spatial only)...")
     wafer_aug = WaferAugmentation()
-    x_aug = wafer_aug(x)
-    print(f"Augmented shape: {x_aug.shape}")
+    before_defects_spatial = x[:13].sum().item()
+    before_defects_radial  = x[13:].sum().item()
+
+    x_dropped = wafer_aug.defect_dropout(x, dropout_rate_range=(0.3, 0.3), n_spatial_channels=13)
+
+    after_defects_spatial = x_dropped[:13].sum().item()
+    after_defects_radial  = x_dropped[13:].sum().item()
+
+    print(f"Spatial defects  before: {before_defects_spatial:.0f}, after: {after_defects_spatial:.0f}")
+    print(f"Radial  channels before: {before_defects_radial:.0f},  after: {after_defects_radial:.0f}  (변화 없어야 함)")
+    assert before_defects_radial == after_defects_radial, "Radial 채널이 변경됨!"
+    assert after_defects_spatial < before_defects_spatial, "Spatial dropout이 적용되지 않음!"
 
     # Test BYOL augmentation
-    print("\nTesting BYOL augmentation...")
-    byol_aug = get_byol_augmentation('strong')
+    print("\nTesting BYOL augmentation (strong)...")
+    byol_aug = get_byol_augmentation('strong', n_spatial_channels=13)
     view1, view2 = byol_aug(x)
     print(f"View 1 shape: {view1.shape}")
     print(f"View 2 shape: {view2.shape}")
 
     # Test batch processing
     print("\nTesting batch augmentation...")
-    batch = torch.rand(4, 1, 128, 128)
-    view1_batch = []
-    view2_batch = []
+    batch = torch.zeros(4, C, H, W)
+    batch[:, :13] = (torch.rand(4, 13, H, W) > 0.85).float()
 
+    view1_batch, view2_batch = [], []
     for i in range(batch.size(0)):
         v1, v2 = byol_aug(batch[i])
         view1_batch.append(v1)
@@ -486,7 +565,6 @@ def test_augmentation():
 
     view1_batch = torch.stack(view1_batch)
     view2_batch = torch.stack(view2_batch)
-
     print(f"Batch view 1 shape: {view1_batch.shape}")
     print(f"Batch view 2 shape: {view2_batch.shape}")
 
