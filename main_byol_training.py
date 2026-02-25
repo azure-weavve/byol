@@ -23,7 +23,7 @@ import json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.byol import BYOL, get_tau_schedule
-from utils.augmentation import get_byol_augmentation
+from utils.batch_augmentation import get_batch_byol_augmentation
 from utils.train_byol import (
     train_byol_epoch, validate_byol_epoch, extract_features,
     save_checkpoint, load_checkpoint, EarlyStopping, detect_collapse, log_training_info
@@ -242,7 +242,10 @@ def train_byol_wafer(config):
 
     # Augmentation
     print("Setting up augmentation...")
-    augmentation = get_byol_augmentation(config['augmentation_type'])
+    augmentation = get_batch_byol_augmentation(
+        config['augmentation_type'],
+        n_spatial_channels=config.get('n_spatial_channels', 13)
+    )
 
     # ✅ 수정: resume 파라미터 전달
     resume_training = config.get('resume_path') is not None and os.path.exists(config.get('resume_path', ''))
@@ -558,6 +561,9 @@ def get_default_config(path):
         'early_stopping_patience': 6,          # eval_frequence * early_stopping_patience로 실제 early_stopping 적용
         'early_stopping_delta': 0.01,
         'early_stopping_mode': 'max',          # min, max 중 하나
+
+        # bin category channel
+        'n_spatial_channels' : 13,             # BIN Category Channel 수
 
         # Paths
         'save_dir': 'checkpoints',

@@ -167,20 +167,27 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
         else:
             images = data
 
+        # images = images.to(device)
+        # batch_size = images.size(0)
+
+        # # Generate two augmented views
+        # view1_list = []
+        # view2_list = []
+
+        # for i in range(batch_size):
+        #     v1, v2 = augmentation(images[i])
+        #     view1_list.append(v1)
+        #     view2_list.append(v2)
+
+        # view1 = torch.stack(view1_list).to(device)
+        # view2 = torch.stack(view2_list).to(device)
+
         images = images.to(device)
         batch_size = images.size(0)
 
-        # Generate two augmented views
-        view1_list = []
-        view2_list = []
-
-        for i in range(batch_size):
-            v1, v2 = augmentation(images[i])
-            view1_list.append(v1)
-            view2_list.append(v2)
-
-        view1 = torch.stack(view1_list).to(device)
-        view2 = torch.stack(view2_list).to(device)
+        # Generate two augmented views (batch vectorized)
+        view1 = augmentation(images)
+        view2 = augmentation(images)
 
         # Forward pass
         optimizer.zero_grad()
@@ -320,20 +327,27 @@ def validate_byol_epoch(model, dataloader, device, augmentation, verbose=True):
             else:
                 images = data
 
+            # images = images.to(device)
+            # batch_size = images.size(0)
+
+            # # Generate two augmented views
+            # view1_list = []
+            # view2_list = []
+
+            # for i in range(batch_size):
+            #     v1, v2 = augmentation(images[i])
+            #     view1_list.append(v1)
+            #     view2_list.append(v2)
+
+            # view1 = torch.stack(view1_list).to(device)
+            # view2 = torch.stack(view2_list).to(device)
+
             images = images.to(device)
             batch_size = images.size(0)
 
-            # Generate two augmented views
-            view1_list = []
-            view2_list = []
-
-            for i in range(batch_size):
-                v1, v2 = augmentation(images[i])
-                view1_list.append(v1)
-                view2_list.append(v2)
-
-            view1 = torch.stack(view1_list).to(device)
-            view2 = torch.stack(view2_list).to(device)
+            # Generate two augmented views (batch vectorized)
+            view1 = augmentation(images)
+            view2 = augmentation(images)
 
             # Forward pass
             loss = model(view1, view2)

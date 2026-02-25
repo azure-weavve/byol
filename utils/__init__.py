@@ -35,12 +35,19 @@ from .byol_monitor import (
     visualize_latent_space
 )
 
+from .batch_augmentation import (
+    BatchBYOLAugmentation,
+    get_batch_byol_augmentation
+)
+
 __all__ = [
     # Augmentation
     'D4Transform',
     'WaferAugmentation',
     'BYOLAugmentation',
     'get_byol_augmentation',
+    'BatchBYOLAugmentation',
+    'get_batch_byol_augmentation', 
 
     # Training
     'train_byol_epoch',
@@ -63,5 +70,5 @@ __all__ = [
 
     # Monitoring
     'BYOLMonitor',
-    'visualize_latent_space'
+    'visualize_latent_space',
 ]
