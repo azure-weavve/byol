@@ -113,7 +113,7 @@ def compute_covariance_loss(features):
     return loss
 
 
-def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, epoch=0, total_epochs=100, variance_config=None, verbose=True):
+def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, augmentation_strong=None, epoch=0, total_epochs=100, variance_config=None, verbose=True):
     """
     Train BYOL for one epoch
 
@@ -167,27 +167,15 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
         else:
             images = data
 
-        # images = images.to(device)
-        # batch_size = images.size(0)
-
-        # # Generate two augmented views
-        # view1_list = []
-        # view2_list = []
-
-        # for i in range(batch_size):
-        #     v1, v2 = augmentation(images[i])
-        #     view1_list.append(v1)
-        #     view2_list.append(v2)
-
-        # view1 = torch.stack(view1_list).to(device)
-        # view2 = torch.stack(view2_list).to(device)
-
         images = images.to(device)
         batch_size = images.size(0)
 
         # Generate two augmented views (batch vectorized)
-        view1 = augmentation(images)
-        view2 = augmentation(images)
+        view1 = augmentation(images)           # weak (C4만 또는 약한 dropout)
+        if augmentation_strong is not None:
+            view2 = augmentation_strong(images)  # strong (C4 + 강한 dropout)
+        else:
+            view2 = augmentation(images)         # 기존과 동일 (symmetric)
 
         # Forward pass
         optimizer.zero_grad()
@@ -293,7 +281,7 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, ep
     return avg_total_loss, avg_byol_loss, avg_var_loss, avg_cov_loss, avg_feat_std, avg_cos_sim
 
 
-def validate_byol_epoch(model, dataloader, device, augmentation, verbose=True):
+def validate_byol_epoch(model, dataloader, device, augmentation, augmentation_strong=None, verbose=True):
     """
     Validate BYOL for one epoch
 
@@ -327,27 +315,15 @@ def validate_byol_epoch(model, dataloader, device, augmentation, verbose=True):
             else:
                 images = data
 
-            # images = images.to(device)
-            # batch_size = images.size(0)
-
-            # # Generate two augmented views
-            # view1_list = []
-            # view2_list = []
-
-            # for i in range(batch_size):
-            #     v1, v2 = augmentation(images[i])
-            #     view1_list.append(v1)
-            #     view2_list.append(v2)
-
-            # view1 = torch.stack(view1_list).to(device)
-            # view2 = torch.stack(view2_list).to(device)
-
             images = images.to(device)
             batch_size = images.size(0)
 
             # Generate two augmented views (batch vectorized)
-            view1 = augmentation(images)
-            view2 = augmentation(images)
+            view1 = augmentation(images)           # weak (C4만 또는 약한 dropout)
+            if augmentation_strong is not None:
+                view2 = augmentation_strong(images)  # strong (C4 + 강한 dropout)
+            else:
+                view2 = augmentation(images)         # 기존과 동일 (symmetric)
 
             # Forward pass
             loss = model(view1, view2)

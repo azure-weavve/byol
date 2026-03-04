@@ -367,7 +367,7 @@ class MultiSizeWaferDataset(Dataset):
         return len(self.wafer_maps)
 
     def __getitem__(self, idx):
-        wafer_map = self.wafer_maps[idx]  # (C, H, W) - already multi-channel
+        wafer_map = self.wafer_maps[idx].copy()  # (C, H, W) - already multi-channel
         label = self.labels[idx]
         original_idx = self.original_indices[idx]
 
@@ -470,7 +470,8 @@ def collate_fn(batch):
     if len(safe_data) == 0:
         # 모든 샘플이 문제인 경우 더미 배치 반환
         # Multi-channel dummy
-        dummy = torch.zeros((1, 13, 128, 128), dtype=torch.float32)  # 11 channels
+        n_ch = safe_data[0].shape[0] if len(safe_data) > 0 else 29  # 13이 아닌 실제 채널 수로
+        dummy = torch.zeros((1, n_ch, 128, 128), dtype=torch.float32)
         return dummy, None, ["dummy"], [0]
 
     batch_data = torch.stack(safe_data)
@@ -544,8 +545,8 @@ def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128)
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=0,
-        pin_memory=False,
+        num_workers=2,
+        pin_memory=True,
         drop_last=True
     )
 
@@ -554,8 +555,8 @@ def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128)
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=0,
-        pin_memory=False,
+        num_workers=2,
+        pin_memory=True,
         drop_last=True
     )
 

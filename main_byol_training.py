@@ -242,10 +242,8 @@ def train_byol_wafer(config):
 
     # Augmentation
     print("Setting up augmentation...")
-    augmentation = get_batch_byol_augmentation(
-        config['augmentation_type'],
-        n_spatial_channels=config.get('n_spatial_channels', 13)
-    )
+    aug_weak = get_batch_byol_augmentation('weak', n_spatial_channels=config.get('n_spatial_channels', 13))
+    aug_strong = get_batch_byol_augmentation('strong', n_spatial_channels=config.get('n_spatial_channels', 13))
 
     # ✅ 수정: resume 파라미터 전달
     resume_training = config.get('resume_path') is not None and os.path.exists(config.get('resume_path', ''))
@@ -305,12 +303,12 @@ def train_byol_wafer(config):
         # Train
         train_loss, byol_loss, var_loss, cov_loss, feat_std, avg_cos_sim = train_byol_epoch(
             model, train_loader, optimizer, device,
-            tau=tau, augmentation=augmentation, epoch=epoch, variance_config=variance_config, verbose=False
+            tau=tau, augmentation=aug_weak, augmentation_strong=aug_strong, epoch=epoch, variance_config=variance_config, verbose=False
         )
 
         # Validate
         val_loss = validate_byol_epoch(
-            model, val_loader, device, augmentation, verbose=False
+            model, val_loader, device, augmentation=aug_weak, augmentation_strong=aug_strong, verbose=False
         )
 
         # Update scheduler
@@ -404,10 +402,11 @@ def train_byol_wafer(config):
                         config=config
                     )
                     # 점수 구성요소도 출력
+                    knn = eval_metrics.get('knn_consistency', {}).get('knn_consistency')
                     sil = eval_metrics.get('clustering', {}).get('silhouette', 0)
                     rot = eval_metrics.get('rotation_invariance', {}).get('avg_cosine_similarity', 0)
                     print(f"  🏆 Best model saved! composite={current_composite:.4f} "
-                        f"(sil={sil:.3f}, rot={rot:.3f}, cos={avg_cos_sim:.3f})")
+                        f"(knn={knn:.3f}, sil={sil:.3f}, rot={rot:.3f}, cos={avg_cos_sim:.3f})")
 
                 # Early stopping 체크
                 if early_stopping(current_composite):
@@ -425,6 +424,7 @@ def train_byol_wafer(config):
             save_checkpoint(
                 model, optimizer, scheduler, epoch, val_loss, save_path,
                 best_val_loss=best_val_loss,
+                best_composite=best_composite,
                 config=config
             )
 
@@ -505,7 +505,7 @@ def get_default_config(path):
 
         # Data parameters
         'wafer_size': 128,
-        'batch_size': 128,
+        'batch_size': 256,
 
         # Model
         'encoder_dim': 512,
@@ -540,8 +540,8 @@ def get_default_config(path):
         'variance_type': 'target_std_robust',  # 'target_std' or 'target_std_robust'
         'variance_target_std': 1.0,            # 목표 std
         'variance_margin': 0.1,                # robust margin (0.9~1.1 허용)
-        'variance_weight': 0.2,                # loss weight
-        'covariance_weight': 0.1,              # 🆕 (0.04 -> 0.1)
+        'variance_weight': 0.05,                # loss weight (0.2 -> 0.05)
+        'covariance_weight': 0.05,              # 🆕 (0.04 -> 0.1 -> 0.05)
 
         # Composite score weights (early stopping & best model 기준)
         'composite_weights': {
