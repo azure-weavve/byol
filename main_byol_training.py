@@ -267,13 +267,22 @@ def train_byol_wafer(config):
     start_epoch = 0
     best_val_loss = float('inf')
     best_composite = -float('inf')  # 🆕 composite score 기준 best
+    pending_evaluation = False  # ✅ evaluation 재시도 플래그
 
     if config.get('resume_path') is not None and os.path.exists(config['resume_path']):
         print(f"\nResuming from checkpoint: {config['resume_path']}")
-        start_epoch, resumed_loss, best_val_loss, best_composite = load_checkpoint(
+        start_epoch, resumed_loss, best_val_loss, best_composite, pending_evaluation = load_checkpoint(
             model, optimizer, scheduler, config['resume_path'], device
         )
-        start_epoch += 1
+        # ✅ temp_checkpoint에서 resume한 경우, evaluation 실패였는지 확인
+        checkpoint = torch.load(config['resume_path'], map_location=device)
+        pending_evaluation = checkpoint.get('pending_evaluation', False)
+        
+        if pending_evaluation:
+            print(f"  ⚠️ Epoch {start_epoch}의 evaluation이 미완료 상태 — 재시도 예정")
+            # start_epoch += 1 하지 않음 → 해당 epoch에서 evaluation만 재시도
+        else:
+            start_epoch += 1
         print(f"Resumed: epoch {start_epoch}, last_loss: {resumed_loss:.4f}, best: {best_val_loss:.4f}")
 
     # Training loop
@@ -285,134 +294,194 @@ def train_byol_wafer(config):
 
     for epoch in range(start_epoch, config['epochs']):
         epoch_start_time = time.time()
-        if epoch == start_epoch:
-            print_gpu_memory("Before Training")
 
-        # 🆕 Variance config 준비
-        variance_config = {
-            'type': config.get('variance_type', 'target_std_robust'),
-            'target_std': config.get('variance_target_std', 1.0),
-            'margin': config.get('variance_margin', 0.1),
-            'weight': config.get('variance_weight', 0.0),
-            'covariance_weight': config.get('covariance_weight', 0.0),  # 🆕
-        }
+        # ✅ pending_evaluation이면 학습 건너뛰고 바로 평가
+        if pending_evaluation and epoch == start_epoch:
+            print(f"\n⏩ Epoch {epoch+1} 학습 건너뜀 — 미완료 evaluation 재시도")
+        else:
+            if epoch == start_epoch:
+                print_gpu_memory("Before Training")
 
-        # Get current tau for EMA update
-        tau = get_tau_schedule(epoch, config['epochs'], config['tau_base'], config['tau_max'])
+            # 🆕 Variance config 준비
+            variance_config = {
+                'type': config.get('variance_type', 'target_std_robust'),
+                'target_std': config.get('variance_target_std', 1.0),
+                'margin': config.get('variance_margin', 0.1),
+                'weight': config.get('variance_weight', 0.0),
+                'covariance_weight': config.get('covariance_weight', 0.0),  # 🆕
+            }
 
-        # Train
-        train_loss, byol_loss, var_loss, cov_loss, feat_std, avg_cos_sim = train_byol_epoch(
-            model, train_loader, optimizer, device,
-            tau=tau, augmentation=aug_weak, augmentation_strong=aug_strong, epoch=epoch, variance_config=variance_config, verbose=False
-        )
+            # Get current tau for EMA update
+            tau = get_tau_schedule(epoch, config['epochs'], config['tau_base'], config['tau_max'])
 
-        # Validate
-        val_loss = validate_byol_epoch(
-            model, val_loader, device, augmentation=aug_weak, augmentation_strong=aug_strong, verbose=False
-        )
+            # Train
+            t0 = time.time()
+            train_loss, byol_loss, var_loss, cov_loss, feat_std, avg_cos_sim = train_byol_epoch(
+                model, train_loader, optimizer, device,
+                tau=tau, augmentation=aug_weak, augmentation_strong=aug_strong, epoch=epoch, variance_config=variance_config, verbose=False
+            )
+            train_time = time.time() - t0
 
-        # Update scheduler
-        scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
+            # Validate
+            t0 = time.time()
+            val_loss = validate_byol_epoch(
+                model, val_loader, device, augmentation=aug_weak, augmentation_strong=aug_strong, verbose=False
+            )
+            validate_time = time.time() - t0
 
-        # Collapse detection
-        with torch.no_grad():
-            # Get some features for collapse detection
-            sample_batch = next(iter(val_loader))
-            if isinstance(sample_batch, (list, tuple)):
-                sample_batch = sample_batch[0]
-            sample_batch = sample_batch[:min(32, len(sample_batch))].to(device)
-            sample_features = model.get_embeddings(sample_batch, use_target=True)
+            # Update scheduler
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
 
-            is_collapsed, collapse_info = detect_collapse(sample_features)
-        
-        if epoch == start_epoch:
-            print_gpu_memory("After First Epoch (Peak = Max Training Memory)")
+            # Collapse detection
+            t0 = time.time()
+            with torch.no_grad():
+                # Get some features for collapse detection
+                sample_batch = next(iter(val_loader))
+                if isinstance(sample_batch, (list, tuple)):
+                    sample_batch = sample_batch[0]
+                sample_batch = sample_batch[:min(32, len(sample_batch))].to(device)
+                sample_features = model.get_embeddings(sample_batch, use_target=True)
 
-        # Log to monitor
-        monitor.log_epoch(epoch, train_loss, val_loss, current_lr, tau)
-        monitor.log_variance_metrics(
-            epoch=epoch,
-            byol_loss=byol_loss,
-            variance_loss=var_loss,
-            covariance_loss=cov_loss,                                       # 🆕
-            variance_weight=variance_config['weight'],
-            covariance_weight=variance_config.get('covariance_weight', 0.0),  # 🆕
-            feature_std=feat_std,
-            avg_cos_sim=avg_cos_sim,
-            target_std=variance_config.get('target_std', 1.0)
-        )
-        monitor.log_collapse_detection(
-            epoch, collapse_info['feat_std'],
-            collapse_info['avg_cos_sim'], is_collapsed
-        )
+                is_collapsed, collapse_info = detect_collapse(sample_features)
+            collapse_time = time.time() - t0collapse_time = time.time() - t0
+            
+            if epoch == start_epoch:
+                print_gpu_memory("After First Epoch (Peak = Max Training Memory)")
+
+            # Log to monitor
+            monitor.log_epoch(epoch, train_loss, val_loss, current_lr, tau)
+            monitor.log_variance_metrics(
+                epoch=epoch,
+                byol_loss=byol_loss,
+                variance_loss=var_loss,
+                covariance_loss=cov_loss,                                       # 🆕
+                variance_weight=variance_config['weight'],
+                covariance_weight=variance_config.get('covariance_weight', 0.0),  # 🆕
+                feature_std=feat_std,
+                avg_cos_sim=avg_cos_sim,
+                target_std=variance_config.get('target_std', 1.0)
+            )
+            monitor.log_collapse_detection(
+                epoch, collapse_info['feat_std'],
+                collapse_info['avg_cos_sim'], is_collapsed
+            )
+
+        # ✅ 매 epoch 끝에 temp_checkpoint 저장 (evaluation 전에)
+        temp_ckpt_path = os.path.join(config['save_dir'], 'temp_checkpoint.pth')
+
+        # Evaluate periodically
+        eval_time = None
+        should_eval = monitor.should_evaluate(epoch) or (pending_evaluation and epoch == start_epoch)
+        if should_eval:
+            # ✅ evaluation 전: pending 플래그 True로 저장
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, val_loss, temp_ckpt_path,
+                best_val_loss=best_val_loss,
+                best_composite=best_composite,
+                config=config,
+                pending_evaluation=True  # ✅ 평가 미완료 표시
+            )
+
+            t0 = time.time()
+            try:
+                print(f"\nPerforming evaluation at epoch {epoch+1}...")
+                eval_metrics, cluster_labels = evaluate_all(
+                    model, val_loader, device, n_samples_invariance=100, k_knn=config['k_knn'], log_dir=config['log_dir']
+                )
+                print_evaluation_results(eval_metrics)
+
+                monitor.log_evaluation(epoch, eval_metrics)
+
+                # 첫 evaluation 후 peak memory 출력 (evaluation이 train보다 메모리를 더 쓸 수 있음)
+                if epoch == start_epoch + config['eval_frequency'] - 1:
+                    print_gpu_memory("After First Evaluation (Overall Peak)")
+
+                # Visualize latent space
+                features, _ = extract_features(model, val_loader, device, use_target=True, verbose=False)
+                visualize_latent_space(
+                    features[:1000],
+                    labels=cluster_labels[:1000] if cluster_labels is not None else None,
+                    method='tsne',
+                    save_path=os.path.join(config['log_dir'], f'latent_space_epoch_{epoch+1}.png'),
+                    title=f'Latent Space (Epoch {epoch+1})'
+                )
+
+                # 🆕 Composite score 계산
+                composite_weights = config.get('composite_weights', {
+                    'knn_consistency': 0.5, 'silhouette': 0.3, 'avg_cos_sim': -0.2
+                })
+                current_composite = compute_composite_score(
+                    eval_metrics, avg_cos_sim, composite_weights
+                )
+
+                if current_composite is not None:
+                    print(f"  📊 Composite Score: {current_composite:.4f} (best: {best_composite:.4f})")
+
+                    # Best model 저장 (composite 기준)
+                    if current_composite > best_composite:
+                        best_composite = current_composite
+                        save_path = os.path.join(config['save_dir'], 'best_model.pth')
+                        save_checkpoint(
+                            model, optimizer, scheduler, epoch, val_loss, save_path,
+                            best_val_loss=best_val_loss,
+                            best_composite=best_composite,
+                            config=config
+                        )
+                        # 점수 구성요소도 출력
+                        knn = eval_metrics.get('knn_consistency', {}).get('knn_consistency')
+                        sil = eval_metrics.get('clustering', {}).get('silhouette', 0)
+                        rot = eval_metrics.get('rotation_invariance', {}).get('avg_cosine_similarity', 0)
+                        print(f"  🏆 Best model saved! composite={current_composite:.4f} "
+                            f"(knn={knn:.3f}, sil={sil:.3f}, rot={rot:.3f}, cos={avg_cos_sim:.3f})")
+
+                    # Early stopping 체크
+                    if early_stopping(current_composite):
+                        print(f"\n⏹ Early stopping at epoch {epoch+1} "
+                            f"(composite score not improving for {config['early_stopping_patience']} evaluations)")
+                        break
+
+                # ✅ evaluation 성공: pending 플래그 False로 덮어쓰기
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, val_loss, temp_ckpt_path,
+                    best_val_loss=best_val_loss,
+                    best_composite=best_composite,
+                    config=config,
+                    pending_evaluation=False
+                )
+
+            except Exception as e:
+                print(f"\n⚠️ Evaluation failed at epoch {epoch+1}: {e}")
+                print(f"  임시 체크포인트 보존: {temp_ckpt_path}")
+                print(f"  resume_path를 이 파일로 설정하면 epoch {epoch}부터 재개 가능")
+
+            eval_time = time.time() - t0
+            pending_evaluation = False  # ✅ 이번 루프에서는 해소
+        else:
+            # ✅ 비평가 epoch: pending 없이 저장
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, val_loss, temp_ckpt_path,
+                best_val_loss=best_val_loss,
+                best_composite=best_composite,
+                config=config,
+                pending_evaluation=False
+            )
 
         # Elapsed time
-        elapsed_time = time.time() - epoch_start_time
+        total_time = time.time() - epoch_start_time
+        timing_info = {
+            'train': train_time,
+            'validate': validate_time,
+            'collapse_detection': collapse_time,
+            'evaluate': eval_time,  # None이면 비평가 에폭
+            'total': total_time
+        }
 
         # Print info
         log_training_info(
             epoch, train_loss, val_loss, current_lr, tau,
-            elapsed_time, collapse_info
+            timing_info, collapse_info
         )
-
-        # Evaluate periodically
-        if monitor.should_evaluate(epoch):
-            print(f"\nPerforming evaluation at epoch {epoch+1}...")
-            eval_metrics, cluster_labels = evaluate_all(
-                model, val_loader, device, n_samples_invariance=100, k_knn=config['k_knn'], log_dir=config['log_dir']
-            )
-            print_evaluation_results(eval_metrics)
-
-            monitor.log_evaluation(epoch, eval_metrics)
-
-            # 첫 evaluation 후 peak memory 출력 (evaluation이 train보다 메모리를 더 쓸 수 있음)
-            if epoch == start_epoch + config['eval_frequency'] - 1:
-                print_gpu_memory("After First Evaluation (Overall Peak)")
-
-            # Visualize latent space
-            features, _ = extract_features(model, val_loader, device, use_target=True, verbose=False)
-            visualize_latent_space(
-                features[:1000],
-                labels=cluster_labels[:1000] if cluster_labels is not None else None,
-                method='tsne',
-                save_path=os.path.join(config['log_dir'], f'latent_space_epoch_{epoch+1}.png'),
-                title=f'Latent Space (Epoch {epoch+1})'
-            )
-
-            # 🆕 Composite score 계산
-            composite_weights = config.get('composite_weights', {
-                'knn_consistency': 0.5, 'silhouette': 0.3, 'avg_cos_sim': -0.2
-            })
-            current_composite = compute_composite_score(
-                eval_metrics, avg_cos_sim, composite_weights
-            )
-
-            if current_composite is not None:
-                print(f"  📊 Composite Score: {current_composite:.4f} (best: {best_composite:.4f})")
-
-                # Best model 저장 (composite 기준)
-                if current_composite > best_composite:
-                    best_composite = current_composite
-                    save_path = os.path.join(config['save_dir'], 'best_model.pth')
-                    save_checkpoint(
-                        model, optimizer, scheduler, epoch, val_loss, save_path,
-                        best_val_loss=best_val_loss,
-                        best_composite=best_composite,
-                        config=config
-                    )
-                    # 점수 구성요소도 출력
-                    knn = eval_metrics.get('knn_consistency', {}).get('knn_consistency')
-                    sil = eval_metrics.get('clustering', {}).get('silhouette', 0)
-                    rot = eval_metrics.get('rotation_invariance', {}).get('avg_cosine_similarity', 0)
-                    print(f"  🏆 Best model saved! composite={current_composite:.4f} "
-                        f"(knn={knn:.3f}, sil={sil:.3f}, rot={rot:.3f}, cos={avg_cos_sim:.3f})")
-
-                # Early stopping 체크
-                if early_stopping(current_composite):
-                    print(f"\n⏹ Early stopping at epoch {epoch+1} "
-                        f"(composite score not improving for {config['early_stopping_patience']} evaluations)")
-                    break
 
         # Val loss best 별도 추적 (참고용, 저장은 안 함)
         if val_loss < best_val_loss:
@@ -427,11 +496,6 @@ def train_byol_wafer(config):
                 best_composite=best_composite,
                 config=config
             )
-
-        # # ❌ 기존 val_loss 기반 early stopping 제거
-        # if early_stopping(val_loss):
-        #     print(f"\nEarly stopping triggered at epoch {epoch+1}")
-        #     break
 
         # Save plots periodically
         if epoch == 0 or (epoch + 1) % config['save_frequency'] == 0:

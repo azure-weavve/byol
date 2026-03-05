@@ -171,11 +171,11 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
         batch_size = images.size(0)
 
         # Generate two augmented views (batch vectorized)
-        view1 = augmentation(images)           # weak (C4만 또는 약한 dropout)
+        view1 = augmentation(images) # weak (C4만 또는 약한 dropout)
         if augmentation_strong is not None:
-            view2 = augmentation_strong(images)  # strong (C4 + 강한 dropout)
+            view2 = augmentation_strong(images) # strong (C4 + 강한 dropout)
         else:
-            view2 = augmentation(images)         # 기존과 동일 (symmetric)
+            view2 = augmentation(images) # 기존과 동일 (symmetric)
 
         # Forward pass
         optimizer.zero_grad()
@@ -319,11 +319,11 @@ def validate_byol_epoch(model, dataloader, device, augmentation, augmentation_st
             batch_size = images.size(0)
 
             # Generate two augmented views (batch vectorized)
-            view1 = augmentation(images)           # weak (C4만 또는 약한 dropout)
+            view1 = augmentation(images)
             if augmentation_strong is not None:
-                view2 = augmentation_strong(images)  # strong (C4 + 강한 dropout)
+                view2 = augmentation_strong(images)
             else:
-                view2 = augmentation(images)         # 기존과 동일 (symmetric)
+                view2 = augmentation(images)
 
             # Forward pass
             loss = model(view1, view2)
@@ -478,6 +478,8 @@ def load_checkpoint(model, optimizer, scheduler, filepath, device):
         epoch: epoch to resume from
         loss: loss at checkpoint
         best_val_loss: best validation loss (if available)
+        best_composite: best composite score (if available)
+        pending_evaluation: whether evaluation was interrupted (if available)
     """
     checkpoint = torch.load(filepath, map_location=device)
 
@@ -491,11 +493,15 @@ def load_checkpoint(model, optimizer, scheduler, filepath, device):
     loss = checkpoint['loss']
     best_val_loss = checkpoint.get('best_val_loss', float('inf'))  # 🔴 추가
     best_composite = checkpoint.get('best_composite', -float('inf'))  # 추가
+    pending_evaluation = checkpoint.get('pending_evaluation', False)
 
     print(f"Checkpoint loaded from {filepath}")
     print(f"Resuming from epoch {epoch+1}, loss: {loss:.4f}, best_val_loss: {best_val_loss:.4f}, best_composite: {best_composite:.4f}")
 
-    return epoch, loss, best_val_loss, best_composite  # 4개 반환
+    if pending_evaluation:
+        print(f"  ⚠️ Pending evaluation detected for epoch {epoch+1}")
+
+    return epoch, loss, best_val_loss, best_composite, pending_evaluation  # 5개 반환
 
 
 class EarlyStopping:
@@ -585,7 +591,7 @@ def detect_collapse(features, threshold_std=0.01, threshold_cosine=0.99):
     return is_collapsed, info
 
 
-def log_training_info(epoch, train_loss, val_loss, learning_rate, tau, elapsed_time, collapse_info=None):
+def log_training_info(epoch, train_loss, val_loss, learning_rate, tau, timing_info, collapse_info=None):
     """
     Log training information
 
@@ -595,7 +601,7 @@ def log_training_info(epoch, train_loss, val_loss, learning_rate, tau, elapsed_t
         val_loss: validation loss
         learning_rate: current learning rate
         tau: current tau value
-        elapsed_time: time elapsed for epoch
+        timing_info: dict with keys 'train', 'validate', 'collapse_detection', 'evaluate' (or None), 'total'
         collapse_info: collapse detection info (optional)
     """
     print(f"\n{'='*60}")
@@ -603,7 +609,14 @@ def log_training_info(epoch, train_loss, val_loss, learning_rate, tau, elapsed_t
     print(f"{'='*60}")
     print(f"Train Loss: {train_loss:.6f} / Val Loss: {val_loss:.6f}")
     print(f"Learning Rate: {learning_rate:.6e} / Tau (EMA): {tau:.6f}")
-    print(f"Time: {elapsed_time:.2f}s")
+    print(f"  Train:              {timing_info['train']:.2f}s")
+    print(f"  Validate:           {timing_info['validate']:.2f}s")
+    print(f"  Collapse Detection: {timing_info['collapse_detection']:.2f}s")
+    if timing_info['evaluate'] is not None:
+        print(f"  Evaluate:           {timing_info['evaluate']:.2f}s")
+    else:
+        print(f"  Evaluate:           Not evaluated")
+    print(f"  Total:              {timing_info['total']:.2f}s")
 
     if collapse_info is not None:
         print(f"\nCollapse Detection:")

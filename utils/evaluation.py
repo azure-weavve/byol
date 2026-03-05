@@ -13,6 +13,7 @@ import os
 import torch
 import numpy as np
 import pandas as pd
+import torch.nn.functional as F
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 from sklearn.cluster import DBSCAN
 
@@ -199,14 +200,15 @@ def compute_pairwise_distances(features, metric='euclidean'):
     return distances
 
 
-def evaluate_retrieval(features, k=5, metric='euclidean', ground_truth_func=None):
+def evaluate_retrieval(features, k=5, metric='euclidean', batch_size=256, ground_truth_func=None):
     """
-    Evaluate retrieval quality
+    Evaluate retrieval quality (memory-efficient batch-wise version)
 
     Args:
         features: (N, D) feature tensor
         k: number of nearest neighbors
         metric: distance metric
+        batch_size: batch size for pairwise distance computation
         ground_truth_func: function to determine if two samples are similar
                           (optional, for synthetic evaluation)
 
@@ -214,16 +216,32 @@ def evaluate_retrieval(features, k=5, metric='euclidean', ground_truth_func=None
         metrics: dict with Precision@k, Recall@k, MRR
     """
     N = features.size(0)
+    nearest_neighbors = torch.zeros(N, k, dtype=torch.long)
+    topk_dists_all = []
 
-    # Compute distances
-    distances = compute_pairwise_distances(features, metric=metric)
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        batch = features[start:end]  # (B, D)
 
-    # Get k nearest neighbors for each sample (excluding self)
-    # Sort by distance
-    sorted_indices = torch.argsort(distances, dim=1)
+        # batch vs 전체: (B, N) 거리 행렬만 생성
+        if metric == 'euclidean':
+            dists = torch.cdist(batch, features)  # (B, N)
+        elif metric == 'cosine':
+            batch_norm = F.normalize(batch, dim=1)
+            features_norm = F.normalize(features, dim=1)
+            dists = 1 - torch.mm(batch_norm, features_norm.t())  # (B, N)
+        else:
+            raise ValueError(f"Unknown metric: {metric}")
 
-    # Exclude self (first element is always self with distance 0)
-    nearest_neighbors = sorted_indices[:, 1:k+1]
+        # self-distance를 큰 값으로 마스킹
+        for i in range(end - start):
+            dists[i, start + i] = float('inf')
+
+        # top-k만 추출 (전체 argsort 불필요)
+        topk_d, topk_idx = torch.topk(dists, k, dim=1, largest=False)
+
+        nearest_neighbors[start:end] = topk_idx
+        topk_dists_all.append(topk_d)
 
     # If ground truth function is provided, compute precision/recall
     if ground_truth_func is not None:
@@ -270,16 +288,13 @@ def evaluate_retrieval(features, k=5, metric='euclidean', ground_truth_func=None
         }
 
     else:
-        # Without ground truth, just return average distances
-        avg_distances = []
-        for i in range(N):
-            top_k = nearest_neighbors[i]
-            avg_dist = distances[i, top_k].mean().item()
-            avg_distances.append(avg_dist)
+        # Without ground truth, compute average distances from collected top-k distances
+        topk_dists_all = torch.cat(topk_dists_all, dim=0)  # (N, k)
+        avg_per_sample = topk_dists_all.mean(dim=1).numpy()  # (N,)
 
         metrics = {
-            'avg_distance_top_k': np.mean(avg_distances),
-            'std_distance_top_k': np.std(avg_distances)
+            'avg_distance_top_k': float(np.mean(avg_per_sample)),
+            'std_distance_top_k': float(np.std(avg_per_sample))
         }
 
     return metrics
