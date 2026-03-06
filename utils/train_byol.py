@@ -591,7 +591,7 @@ def detect_collapse(features, threshold_std=0.01, threshold_cosine=0.99):
     return is_collapsed, info
 
 
-def log_training_info(epoch, train_loss, val_loss, learning_rate, tau, timing_info, collapse_info=None):
+def log_training_info(epoch, train_loss, val_loss, learning_rate, tau, timing_info, mem, collapse_info=None):
     """
     Log training information
 
@@ -604,19 +604,15 @@ def log_training_info(epoch, train_loss, val_loss, learning_rate, tau, timing_in
         timing_info: dict with keys 'train', 'validate', 'collapse_detection', 'evaluate' (or None), 'total'
         collapse_info: collapse detection info (optional)
     """
+    eval_time = f"{timing_info['evaluate']:.2f}s" if timing_info['evaluate'] is not None else "Not evaluated"
     print(f"\n{'='*60}")
     print(f"Epoch {epoch+1} Summary")
     print(f"{'='*60}")
     print(f"Train Loss: {train_loss:.6f} / Val Loss: {val_loss:.6f}")
     print(f"Learning Rate: {learning_rate:.6e} / Tau (EMA): {tau:.6f}")
-    print(f"  Train:              {timing_info['train']:.2f}s")
-    print(f"  Validate:           {timing_info['validate']:.2f}s")
-    print(f"  Collapse Detection: {timing_info['collapse_detection']:.2f}s")
-    if timing_info['evaluate'] is not None:
-        print(f"  Evaluate:           {timing_info['evaluate']:.2f}s")
-    else:
-        print(f"  Evaluate:           Not evaluated")
-    print(f"  Total:              {timing_info['total']:.2f}s")
+    print(f"Time:")
+    print(f"  Train: {timing_info['train']:.2f}s / Valid: {timing_info['validate']:.2f}s / Collapse Detection: {timing_info['collapse_detection']:.2f}s / Evaluate: {eval_time} Total: {timing_info['total']:.2f}s")
+    print(f"  Memory - Total: {mem.total / 1024**3:.1f} GB / Available: {mem.available / 1024**3:.1f} GB / Used: {mem.used / 1024**3:.1f} GB / Percent: {mem.percent}%")
 
     if collapse_info is not None:
         print(f"\nCollapse Detection:")
