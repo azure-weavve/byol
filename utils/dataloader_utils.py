@@ -7,6 +7,7 @@ import os
 from utils.wafermap_filter import WaferMapFilter
 from utils.density_aware_filter import DensityAwareWaferMapFilter
 from utils.region_aware_filter import RegionAwareWaferMapFilter
+import psutil
 
 
 def convert_to_multichannel(wafer_maps, n_categories=12):
@@ -470,8 +471,7 @@ def collate_fn(batch):
     if len(safe_data) == 0:
         # 모든 샘플이 문제인 경우 더미 배치 반환
         # Multi-channel dummy
-        n_ch = safe_data[0].shape[0] if len(safe_data) > 0 else 29  # 13이 아닌 실제 채널 수로
-        dummy = torch.zeros((1, n_ch, 128, 128), dtype=torch.float32)
+        dummy = torch.zeros((1, 13, 128, 128), dtype=torch.float32)
         return dummy, None, ["dummy"], [0]
 
     batch_data = torch.stack(safe_data)
@@ -485,9 +485,53 @@ def collate_fn(batch):
 
 
 
+def get_safe_num_workers(default=4):
+    """
+    가용 RAM에 따라 안전한 num_workers 결정
+    """
+    available_gb = psutil.virtual_memory().available / (1024**3)
+    if available_gb < 8:
+        num_workers = 0
+    elif available_gb < 12:
+        num_workers = 2
+    else:
+        num_workers = default
+    print(f"   num_workers: {num_workers} (가용 RAM: {available_gb:.1f}GB)")
+    return num_workers
+
+
+def recreate_dataloaders(train_dataset, valid_dataset, batch_size, num_workers, drop_last=True):
+    """
+    DataLoader worker 오류 발생 시 num_workers를 줄여서 재생성
+    """
+    pin_memory = (num_workers > 0)
+    print(f"   🔄 DataLoader 재생성 중... num_workers={num_workers}")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last
+    )
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last
+    )
+    return train_loader, valid_loader
+
+
+
 def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128), test_size=0.2, 
                         use_filter=True, filter_on_the_fly=False, filter_params=None, 
-                        use_density_aware=False, use_augmentation=False):
+                        use_density_aware=False, use_augmentation=False, drop_last=True):
     
     print("\n🔧 안전한 DataLoader 생성")
     print("="*40)
@@ -539,15 +583,18 @@ def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128)
     print(f"   Train: {len(train_dataset)}개 (Augmentation: {use_augmentation})")
     print(f"   Valid: {len(valid_dataset)}개 (Augmentation: False Fixed)")
 
+    _num_workers = get_safe_num_workers(default=4)
+    _pin_memory = (_num_workers > 0)
+
     # DataLoader 생성
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=2,
-        pin_memory=True,
-        drop_last=True
+        num_workers=_num_workers,
+        pin_memory=_pin_memory,
+        drop_last=drop_last
     )
 
     valid_loader = DataLoader(
@@ -555,9 +602,9 @@ def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128)
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=2,
-        pin_memory=True,
-        drop_last=True
+        num_workers=_num_workers,
+        pin_memory=_pin_memory,
+        drop_last=drop_last
     )
 
     print(f"   Train 배치: {len(train_loader)}개 / Valid 배치: {len(valid_loader)}개")

@@ -31,7 +31,7 @@ from utils.train_byol import (
 )
 from utils.evaluation import evaluate_all, print_evaluation_results
 from utils.byol_monitor import BYOLMonitor, visualize_latent_space
-from utils.dataloader_utils import prepare_clean_data, create_dataloaders
+from utils.dataloader_utils import prepare_clean_data, create_dataloaders, recreate_dataloaders
 from utils.gpu_monitor import print_gpu_memory, reset_peak_stats, get_peak_memory_mb
 
 
@@ -198,6 +198,7 @@ def train_byol_wafer(config):
         use_density_aware=False,
         use_augmentation=False  # BYOL applies augmentation in train_byol_epoch
     )
+    current_num_workers = train_loader.num_workers  # fallback 추적용
 
     print(f"Train samples: {len(train_loader.dataset)}")
     print(f"Val samples: {len(val_loader.dataset)}")
@@ -291,6 +292,8 @@ def train_byol_wafer(config):
 
     # Peak memory 측정 시작
     reset_peak_stats()
+    mem = psutil.virtual_memory()
+    print(f"  Before Start Memory - Total: {mem.total / 1024**3:.1f} GB / Available: {mem.available / 1024**3:.1f} GB / Used: {mem.used / 1024**3:.1f} GB / Percent: {mem.percent}%")
 
     for epoch in range(start_epoch, config['epochs']):
         epoch_start_time = time.time()
@@ -316,25 +319,49 @@ def train_byol_wafer(config):
                 'margin': config.get('variance_margin', 0.1),
                 'weight': config.get('variance_weight', 0.0),
                 'covariance_weight': config.get('covariance_weight', 0.0),
+                'uniformity_weight': config.get('uniformity_weight', 0.0),
             }
 
             # Get current tau for EMA update
             tau = get_tau_schedule(epoch, config['epochs'], config['tau_base'], config['tau_max'])
 
-            # Train
-            t0 = time.time()
-            train_loss, byol_loss, var_loss, cov_loss, feat_std, avg_cos_sim = train_byol_epoch(
-                model, train_loader, optimizer, device,
-                tau=tau, augmentation=aug_weak, augmentation_strong=aug_strong, epoch=epoch, variance_config=variance_config, verbose=False
-            )
-            train_time = time.time() - t0
+            # Worker 오류 시 num_workers를 줄여서 최대 3회 재시도
+            max_retries = 3
 
-            # Validate
-            t0 = time.time()
-            val_loss = validate_byol_epoch(
-                model, val_loader, device, augmentation=aug_weak, augmentation_strong=aug_strong, verbose=False
-            )
-            validate_time = time.time() - t0
+            for retry in range(max_retries):
+                try:
+                    t0 = time.time()
+                    train_loss, byol_loss, var_loss, cov_loss, uni_loss, feat_std, avg_cos_sim = train_byol_epoch(
+                        model, train_loader, optimizer, device,
+                        tau=tau, augmentation=aug_weak, augmentation_strong=aug_strong, epoch=epoch, variance_config=variance_config, verbose=False
+                    )
+                    train_time = time.time() - t0
+
+                    t0 = time.time()
+                    val_loss = validate_byol_epoch(
+                        model, val_loader, device, augmentation=aug_weak, augmentation_strong=aug_strong, verbose=False
+                    )
+                    validate_time = time.time() - t0
+                    break  # 성공 시 루프 탈출
+
+                except (RuntimeError, OSError) as e:
+                    is_worker_error = (
+                        isinstance(e, OSError) and e.errno == 12  # Cannot allocate memory
+                    ) or (
+                        isinstance(e, RuntimeError) and "worker" in str(e).lower()
+                    )
+                    if is_worker_error and retry < max_retries - 1:
+                        current_num_workers = max(0, current_num_workers // 2)
+                        print(f"\n⚠️  DataLoader worker 오류 감지 (retry {retry+1}/{max_retries-1})")
+                        print(f"   num_workers → {current_num_workers} 으로 줄여서 재시도")
+                        train_loader, val_loader = recreate_dataloaders(
+                            train_loader.dataset, val_loader.dataset,
+                            batch_size=config['batch_size'],
+                            num_workers=current_num_workers,
+                            drop_last=True
+                        )
+                    else:
+                        raise  # worker 오류가 아니거나 재시도 소진 시 그대로 raise
 
             # Update scheduler
             scheduler.step()
@@ -367,7 +394,9 @@ def train_byol_wafer(config):
                 covariance_weight=variance_config.get('covariance_weight', 0.0),
                 feature_std=feat_std,
                 avg_cos_sim=avg_cos_sim,
-                target_std=variance_config.get('target_std', 1.0)
+                target_std=variance_config.get('target_std', 1.0),
+                uniformity_loss=uni_loss,                                    # 🆕
+                uniformity_weight=variance_config.get('uniformity_weight', 0.0)  # 🆕
             )
             monitor.log_collapse_detection(
                 epoch, collapse_info['feat_std'],
@@ -426,20 +455,23 @@ def train_byol_wafer(config):
                 if epoch == start_epoch + config['eval_frequency'] - 1:
                     print_gpu_memory("After First Evaluation (Overall Peak)")
 
-                features, _ = extract_features(model, val_loader, device, use_target=True, verbose=False)
-                visualize_latent_space(
-                    features[:1000],
-                    labels=cluster_labels[:1000] if cluster_labels is not None else None,
-                    method='tsne',
-                    save_path=os.path.join(config['log_dir'], f'latent_space_epoch_{epoch+1}.png'),
-                    title=f'Latent Space (Epoch {epoch+1})'
-                )
+                # features, _ = extract_features(model, val_loader, device, use_target=True, verbose=False)
+                # visualize_latent_space(
+                #     features[:1000],
+                #     labels=cluster_labels[:1000] if cluster_labels is not None else None,
+                #     method='tsne',
+                #     save_path=os.path.join(config['log_dir'], f'latent_space_epoch_{epoch+1}.png'),
+                #     title=f'Latent Space (Epoch {epoch+1})'
+                # )
 
                 composite_weights = config.get('composite_weights', {
                     'knn_consistency': 0.5, 'silhouette': 0.3, 'avg_cos_sim': -0.2
                 })
+
+                # 개선: collapse_info의 에폭 끝 cos_sim 사용
+                epoch_end_cos_sim = collapse_info['avg_cos_sim']
                 current_composite = compute_composite_score(
-                    eval_metrics, avg_cos_sim, composite_weights
+                    eval_metrics, epoch_end_cos_sim, composite_weights
                 )
 
                 if current_composite is not None:
@@ -498,8 +530,8 @@ def train_byol_wafer(config):
             mem = psutil.virtual_memory()
 
             log_training_info(
-                epoch, train_loss, val_loss, current_lr, tau,
-                timing_info, mem, collapse_info
+                epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss, uni_loss, current_lr, tau,
+                timing_info, mem, variance_config, collapse_info
             )
 
             if val_loss < best_val_loss:
@@ -547,7 +579,7 @@ def train_byol_wafer(config):
     monitor.print_summary()
 
     # Final visualization
-    features, _ = extract_features(model, val_loader, device, use_target=True)
+    features, _, _ = extract_features(model, val_loader, device, use_target=True)
     visualize_latent_space(
         features,
         labels=cluster_labels,
@@ -622,6 +654,7 @@ def get_default_config(path):
         'variance_margin': 0.1,                # robust margin (0.9~1.1 허용)
         'variance_weight': 0.05,                # loss weight (0.2 -> 0.05)
         'covariance_weight': 0.05,              # 🆕 (0.04 -> 0.1 -> 0.05)
+        'uniformity_weight': 0.005,
 
         # Composite score weights (early stopping & best model 기준)
         'composite_weights': {
@@ -648,10 +681,10 @@ def get_default_config(path):
         # Paths
         'save_dir': 'checkpoints',
         'log_dir': 'logs',
-        # 'resume_path': None
+        'resume_path': None
         # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/best_model.pth"
         # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/checkpoint_epoch_30.pth"
-        'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/temp_checkpoint.pth"
+        # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/temp_checkpoint.pth"
     }
 
     return config

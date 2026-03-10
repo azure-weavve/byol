@@ -56,6 +56,8 @@ class BYOLMonitor:
                 'target_std': [],
                 'covariance_loss': [],      # 🆕
                 'covariance_weight': [],    # 🆕
+                'uniformity_loss': [],      # 🆕
+                'uniformity_weight': [],    # 🆕
                 # Collapse detection
                 'feat_std_collapse': [],
                 'avg_cos_sim_collapse': [],
@@ -77,7 +79,8 @@ class BYOLMonitor:
         self.history['tau'].append(tau)
     
     def log_variance_metrics(self, epoch, byol_loss, variance_loss, variance_weight,
-                            feature_std, avg_cos_sim, target_std=1.0, covariance_loss=0.0, covariance_weight=0.0):
+                            feature_std, avg_cos_sim, target_std=1.0, covariance_loss=0.0, covariance_weight=0.0,
+                            uniformity_loss=0.0, uniformity_weight=0.0):
         """
         🆕 Log variance regularization metrics
         
@@ -98,6 +101,8 @@ class BYOLMonitor:
         self.history['feature_std'].append(feature_std)
         self.history['avg_cos_sim'].append(avg_cos_sim)
         self.history['target_std'].append(target_std)
+        self.history['uniformity_loss'].append(uniformity_loss)    # 🆕
+        self.history['uniformity_weight'].append(uniformity_weight) # 🆕
     
     def log_collapse_detection(self, epoch, feat_std, avg_cos_sim, is_collapsed):
         """Log collapse detection metrics"""
@@ -145,6 +150,9 @@ class BYOLMonitor:
             if self.history.get('covariance_loss') and any(v > 0 for v in self.history['covariance_loss']):
                 ax.plot(epochs, self.history['covariance_loss'], label='Covariance Loss',
                        linewidth=2, color='green', linestyle='--')
+            if self.history.get('uniformity_loss') and any(v > 0 for v in self.history['uniformity_loss']):
+                ax.plot(epochs, self.history['uniformity_loss'], label='Uniformity Loss',
+                    linewidth=2, color='purple', linestyle=':')  # 🆕
             ax.set_xlabel('Epoch')
             ax.set_ylabel('Loss')
             ax.set_title('Loss Components')
@@ -288,50 +296,59 @@ class BYOLMonitor:
             print(f"✅ Variance analysis saved to {save_path}")
         
         plt.close()
-    
+
     def plot_evaluation_metrics(self, save_path=None):
         """
         Plot evaluation metrics over time
-        
-        ✅ 재개 학습 시 이전 데이터 + 현재 데이터 함께 표시
-
-        Args:
-            save_path: path to save plot
         """
         if save_path is None:
             save_path = os.path.join(self.log_dir, 'evaluation_metrics.png')
 
-        # Find evaluation metrics
-        eval_keys = [k for k in self.history.keys() 
-                     if k.startswith(('retrieval_', 'clustering_', 'rotation_'))]
+        # evaluation이 실행된 epoch 인덱스 추출 (silhouette 기준)
+        eval_indices = [i for i, v in enumerate(self.history['silhouette']) if v is not None]
 
-        if len(eval_keys) == 0:
+        if len(eval_indices) == 0:
             print("ℹ️  No evaluation metrics to plot")
             return
 
-        # Create subplots
-        n_metrics = len(eval_keys)
+        eval_epochs = [self.history['epoch'][i] for i in eval_indices]
+
+        # 그릴 metric 목록 (key, 표시 이름, 색상)
+        eval_metrics_config = [
+            ('knn_consistency',    'kNN Consistency',    '#1f77b4'),
+            ('silhouette',         'Silhouette Score',   '#2ca02c'),
+            ('rotation_invariance','Rotation Invariance','#ff7f0e'),
+            ('n_clusters',         'N Clusters',         '#9467bd'),
+            ('noise_ratio',        'Noise Ratio',        '#d62728'),
+        ]
+
         n_cols = 3
-        n_rows = (n_metrics + n_cols - 1) // n_cols
+        n_rows = (len(eval_metrics_config) + n_cols - 1) // n_cols
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 5*n_rows))
-        axes = axes.flatten() if n_rows > 1 else [axes] if n_cols == 1 else axes
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 5 * n_rows))
+        axes = axes.flatten()
 
-        for i, key in enumerate(eval_keys):
-            if i >= len(axes):
-                break
+        for i, (key, title, color) in enumerate(eval_metrics_config):
+            data = self.history.get(key, [])
+            # eval_indices에 해당하는 값만 추출
+            values = [data[idx] for idx in eval_indices if idx < len(data)]
+            epochs_to_plot = eval_epochs[:len(values)]
 
-            data = self.history[key]
-            if len(data) > 0:
-                epochs, values = zip(*data)
-                axes[i].plot(epochs, values, marker='o', linewidth=2, color='#1f77b4')
+            valid_pairs = [(e, v) for e, v in zip(epochs_to_plot, values) if v is not None]
+
+            if valid_pairs:
+                e_list, v_list = zip(*valid_pairs)
+                axes[i].plot(e_list, v_list, marker='o', linewidth=2, color=color)
                 axes[i].set_xlabel('Epoch')
                 axes[i].set_ylabel('Value')
-                axes[i].set_title(key.replace('_', ' ').title() + ' (전체 학습 기록)')
+                axes[i].set_title(title)
                 axes[i].grid(True, alpha=0.3)
+            else:
+                axes[i].set_title(title + ' (no data)')
+                axes[i].axis('off')
 
-        # Hide unused subplots
-        for i in range(len(eval_keys), len(axes)):
+        # 남은 subplot 숨기기
+        for i in range(len(eval_metrics_config), len(axes)):
             axes[i].axis('off')
 
         plt.tight_layout()
@@ -366,6 +383,17 @@ class BYOLMonitor:
         if os.path.exists(history_path):
             with open(history_path, 'r') as f:
                 self.history = json.load(f)
+
+            if 'knn_consistency' not in self.history:
+                n_evals = len(self.history.get('silhouette', []))
+                self.history['knn_consistency'] = [None] * n_evals
+
+            # ✅ 아래에 추가
+            n_epochs = len(self.history.get('epoch', []))
+            for key in ['uniformity_loss', 'uniformity_weight']:
+                if key not in self.history:
+                    self.history[key] = [0.0] * n_epochs
+                    
             return True
         return False
     

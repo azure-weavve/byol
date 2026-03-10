@@ -1,399 +1,612 @@
-"""
-Batch Vectorized Augmentation for BYOL Training
-
-기존 BYOLAugmentation의 for-loop 병목을 제거하고
-배치 단위로 C4 회전 + defect dropout을 한 번에 처리.
-
-기존 BYOLAugmentation과 동일한 augmentation 결과를 보장하되,
-128번의 개별 CUDA 커널 호출 → 최대 4번으로 감소.
-
-PyTorch 1.4.0 compatible
-"""
-
 import torch
-import random
+import torch.nn.functional as F
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+import os
+from utils.wafermap_filter import WaferMapFilter
+from utils.density_aware_filter import DensityAwareWaferMapFilter
+from utils.region_aware_filter import RegionAwareWaferMapFilter
+import psutil
 
 
-class BatchBYOLAugmentation:
+def convert_to_multichannel(wafer_maps, n_categories=12):
     """
-    배치 단위 BYOL augmentation pipeline
-    
-    기존 BYOLAugmentation과 동일한 동작:
-        view = C4 rotation + defect dropout (spatial 채널만)
-    
-    차이점:
-        - for i in range(batch_size) 루프 제거
-        - C4: 같은 변환 ID끼리 묶어서 배치 rot90 (최대 4번 호출)
-        - Defect dropout: 배치 단위 마스크 생성 (1번 호출)
-    
-    Usage:
-        batch_aug = BatchBYOLAugmentation(
-            use_c4_only=True,
-            use_defect_dropout=True,
-            defect_dropout_prob=0.5,
-            defect_dropout_rate=(0.1, 0.5),
-            n_spatial_channels=13,
-        )
-        view1 = batch_aug(images)  # (B, C, H, W) → (B, C, H, W)
-        view2 = batch_aug(images)  # 독립적인 랜덤 변환
-    """
-
-    def __init__(self,
-                 use_d4=True,
-                 use_c4_only=True,
-                 use_defect_dropout=True,
-                 defect_dropout_prob=0.5,
-                 defect_dropout_rate=(0.1, 0.5),
-                 n_spatial_channels=13):
-        """
-        Args:
-            use_d4: D4/C4 변환 사용 여부
-            use_c4_only: True면 C4(회전만), False면 D4(회전+반사)
-            use_defect_dropout: defect dropout 사용 여부
-            defect_dropout_prob: 각 샘플에 dropout을 적용할 확률
-            defect_dropout_rate: (min_rate, max_rate)
-            n_spatial_channels: spatial 채널 수 (나머지는 radial encoding)
-        """
-        self.use_d4 = use_d4
-        self.use_c4_only = use_c4_only
-        self.use_defect_dropout = use_defect_dropout
-        self.defect_dropout_prob = defect_dropout_prob
-        self.defect_dropout_rate = defect_dropout_rate
-        self.n_spatial_channels = n_spatial_channels
-
-        self.n_transforms = 4 if use_c4_only else 8
-
-    def _batch_c4_rotation(self, x):
-        """
-        배치 단위 C4 회전
-        
-        전략: 배치 전체에 랜덤 변환 ID를 할당하고,
-              같은 ID끼리 묶어서 torch.rot90을 호출 (최대 4번)
-        
-        Args:
-            x: (B, C, H, W) tensor
-        
-        Returns:
-            (B, C, H, W) 회전된 tensor
-        """
-        B = x.size(0)
-        device = x.device
-
-        # 배치 전체의 변환 ID를 한 번에 생성
-        transform_ids = torch.randint(0, self.n_transforms, (B,), device=device)
-
-        # 결과 텐서 (원본 복사 - identity인 샘플용)
-        result = x.clone()
-
-        if self.use_c4_only:
-            # C4: 0=identity, 1=90°, 2=180°, 3=270°
-            for k in range(1, 4):  # k=0 (identity)는 이미 clone됨
-                mask = (transform_ids == k)
-                if mask.any():
-                    result[mask] = torch.rot90(x[mask], k=k, dims=(-2, -1))
-        else:
-            # D4: 0-3 = C4 회전, 4 = 좌우반전, 5 = 상하반전, 6 = 대각반전, 7 = 반대각반전
-            for k in range(1, 4):
-                mask = (transform_ids == k)
-                if mask.any():
-                    result[mask] = torch.rot90(x[mask], k=k, dims=(-2, -1))
-
-            # Horizontal flip
-            mask = (transform_ids == 4)
-            if mask.any():
-                result[mask] = torch.flip(x[mask], dims=[-1])
-
-            # Vertical flip
-            mask = (transform_ids == 5)
-            if mask.any():
-                result[mask] = torch.flip(x[mask], dims=[-2])
-
-            # Transpose (diagonal flip)
-            mask = (transform_ids == 6)
-            if mask.any():
-                result[mask] = x[mask].transpose(-2, -1)
-
-            # Anti-transpose (rot90 + transpose)
-            mask = (transform_ids == 7)
-            if mask.any():
-                rotated = torch.rot90(x[mask], k=1, dims=(-2, -1))
-                result[mask] = rotated.transpose(-2, -1)
-
-        return result
-
-    def _batch_defect_dropout(self, x):
-        """
-        배치 단위 defect dropout
-        
-        각 샘플에 독립적인 dropout_rate와 적용 여부를 결정하고,
-        spatial 채널에만 마스킹 적용.
-        
-        Args:
-            x: (B, C, H, W) tensor
-        
-        Returns:
-            (B, C, H, W) dropout 적용된 tensor
-        """
-        B, C, H, W = x.shape
-        device = x.device
-        n_spatial = min(self.n_spatial_channels, C)
-
-        # 각 샘플별 적용 여부 결정: (B,)
-        apply_mask = torch.rand(B, device=device) < self.defect_dropout_prob
-
-        # 적용할 샘플이 없으면 바로 반환
-        if not apply_mask.any():
-            return x
-
-        result = x.clone()
-
-        # 적용 대상 샘플 인덱스
-        apply_indices = apply_mask.nonzero(as_tuple=False).squeeze(1)  # PyTorch 1.4 호환
-        n_apply = apply_indices.size(0)
-
-        # 각 샘플별 dropout rate: uniform(min, max)
-        min_rate, max_rate = self.defect_dropout_rate
-        dropout_rates = torch.rand(n_apply, device=device) * (max_rate - min_rate) + min_rate
-
-        # drop mask: (n_apply, 1, H, W) - 각 샘플별 독립적인 마스크
-        # dropout_rates를 (n_apply, 1, 1, 1)로 reshape하여 broadcasting
-        rand_vals = torch.rand(n_apply, 1, H, W, device=device)
-        drop_masks = rand_vals < dropout_rates.view(n_apply, 1, 1, 1)
-
-        # spatial 채널 추출: (n_apply, n_spatial, H, W)
-        spatial = result[apply_indices, :n_spatial]
-
-        # defect 위치: spatial > 0.5인 곳
-        defect_mask = (spatial > 0.5)  # (n_apply, n_spatial, H, W)
-
-        # drop_masks (n_apply, 1, H, W) broadcast → (n_apply, n_spatial, H, W)
-        # defect이면서 drop 대상인 위치를 0으로
-        spatial[defect_mask & drop_masks] = 0
-
-        result[apply_indices, :n_spatial] = spatial
-
-        return result
-
-    def __call__(self, x):
-        """
-        배치 단위 augmentation 적용 (단일 view 생성)
-        
-        Args:
-            x: (B, C, H, W) tensor (이미 device에 올라와 있어야 함)
-        
-        Returns:
-            (B, C, H, W) augmented tensor
-        """
-        # 1. C4/D4 회전
-        if self.use_d4:
-            view = self._batch_c4_rotation(x)
-        else:
-            view = x.clone()
-
-        # 2. Defect dropout (spatial 채널만)
-        if self.use_defect_dropout:
-            view = self._batch_defect_dropout(view)
-
-        return view
-
-
-def get_batch_byol_augmentation(augmentation_type='strong', n_spatial_channels=13):
-    """
-    배치 단위 BYOL augmentation 생성 함수
-    
-    기존 get_byol_augmentation과 동일한 인터페이스.
+    정수 라벨 배열을 multi-channel one-hot 형식으로 변환 (배치 벡터화)
     
     Args:
-        augmentation_type: 'strong', 'medium', or 'weak'
-        n_spatial_channels: spatial 채널 수
+        wafer_maps: numpy array
+                   - 단일: (H, W) 정수 배열 (값 0~12)
+                   - 배치: (n, H, W) 정수 배열 (값 0~12)
+        n_categories: 불량 카테고리 개수 (기본값: 12)
+                     0은 non-wafer + good chip이므로 제외
     
     Returns:
-        BatchBYOLAugmentation instance
+        multi_channel: numpy array
+                      - 단일 입력: (n_categories+1, H, W)
+                      - 배치 입력: (n, n_categories+1, H, W)
+                      
+                      channel[0] = 불량 위치 (값 > 0)
+                      channel[1~12] = 각 카테고리별 위치 (값 == k)
     """
-    if augmentation_type == 'strong':
-        return BatchBYOLAugmentation(
-            use_d4=True,
-            use_c4_only=True,
-            use_defect_dropout=True,
-            defect_dropout_prob=0.5,
-            defect_dropout_rate=(0.1, 0.5),
-            n_spatial_channels=n_spatial_channels,
-        )
+    # 단일 웨이퍼 처리 (H, W) → 배치 형태로 변환
+    single_input = False
+    if len(wafer_maps.shape) == 2:
+        single_input = True
+        wafer_maps = wafer_maps[np.newaxis, ...]  # (1, H, W)
+    
+    n, H, W = wafer_maps.shape
+    n_channels = n_categories + 1  # 13 channels (0: spatial, 1-12: categories)
+    
+    # 결과 배열 초기화
+    multi_channel = np.zeros((n, n_channels, H, W), dtype=np.float32)
+    
+    # Channel 0: 불량 위치 (값 > 0인 모든 위치)
+    multi_channel[:, 0, :, :] = (wafer_maps > 0).astype(np.float32)
+    
+    # Channel 1~12: 각 카테고리별 one-hot
+    for k in range(1, n_categories + 1):
+        multi_channel[:, k, :, :] = (wafer_maps == k).astype(np.float32)
+    
+    # 단일 입력이었으면 배치 차원 제거
+    if single_input:
+        multi_channel = multi_channel[0]  # (13, H, W)
+    
+    return multi_channel
 
-    elif augmentation_type == 'medium':
-        return BatchBYOLAugmentation(
-            use_d4=True,
-            use_c4_only=True,
-            use_defect_dropout=True,
-            defect_dropout_prob=0.3,
-            defect_dropout_rate=(0.1, 0.3),
-            n_spatial_channels=n_spatial_channels,
-        )
+def detect_n_categories(data_configs):
+    """
+    데이터 파일들을 스캔하여 최대 카테고리 개수 자동 감지 (값 기반)
+    
+    Args:
+        data_configs: [{"path": "...", "name": "..."}, ...]
+    
+    Returns:
+        max_category: 최대 카테고리 번호 (예: 12)
+                     0은 non-wafer + good chip이므로 카테고리에서 제외
+    """
+    max_category = 0
+    
+    for config in data_configs:
+        file_path = config["path"]
+        
+        if not os.path.exists(file_path):
+            print(f"⚠️  파일 없음: {file_path}")
+            continue
+        
+        try:
+            data = np.load(file_path, allow_pickle=True)
+            maps = data['maps']
+            
+            if len(maps) == 0:
+                continue
+            
+            # 샘플링하여 최대값 확인 (전체 스캔은 느릴 수 있음)
+            n_samples = min(100, len(maps))
+            sample_indices = np.linspace(0, len(maps)-1, n_samples, dtype=int)
+            
+            for idx in sample_indices:
+                sample = maps[idx]
+                
+                if not isinstance(sample, np.ndarray):
+                    sample = np.array(sample)
+                
+                sample_max = int(sample.max())
+                max_category = max(max_category, sample_max)
+            
+            print(f"✅ {config.get('name', 'unknown')}: 최대 카테고리 = {max_category}")
+                    
+        except Exception as e:
+            print(f"⚠️  {file_path} 감지 실패: {e}")
+            continue
+    
+    print(f"📊 감지된 최대 카테고리: {max_category}")
+    return max_category
 
-    elif augmentation_type == 'weak':
-        return BatchBYOLAugmentation(
-            use_d4=True,
-            use_c4_only=True,
-            use_defect_dropout=False,
-            n_spatial_channels=n_spatial_channels,
-        )
 
+
+def prepare_clean_data(data_configs, use_filter=True, filter_params=None, 
+                       use_density_aware=False, use_region_aware=False):
+    """
+    여러 제품 데이터를 로드하고 완전히 정리 + 필터링 + Multi-channel 변환
+
+    Args:
+        data_configs: [{"path": "...", "name": "..."}, ...]
+        use_filter: 필터링 적용 여부
+        filter_params: 필터 파라미터 딕셔너리
+        use_density_aware: True면 밀도 기반 적응형 필터 사용
+        use_region_aware: True면 region-aware 필터 사용
+
+    Returns:
+        clean_maps: List of (13, H, W) arrays (size 다를 수 있음)
+        clean_labels: List of labels
+        info: List of filter info dicts
+    """
+
+    print("="*60)
+    
+    # 카테고리 개수 자동 감지
+    n_categories = detect_n_categories(data_configs)
+    n_channels = n_categories + 1  # 13 channels
+    
+    mode_str = "밀도 기반 적응형" if use_density_aware else "일반"
+    print(f"🧹 데이터 완전 정리 시작" + (f" ({mode_str} 필터링 포함)" if use_filter else ""))
+    print(f"📊 Multi-channel format: {n_channels} channels (1 spatial + {n_categories} categories)")
+    print("="*60)
+    
+    # 필터 초기화
+    if use_filter:
+        if use_density_aware:
+            filter_obj = DensityAwareWaferMapFilter()
+        else:
+            if filter_params is None:
+                filter_params = {
+                    'min_component_size': 5,
+                    'opening_kernel_size': 1,
+                    'closing_kernel_size': 5,
+                    'edge_preserve_strength': 0.9
+                }
+            filter_obj = WaferMapFilter(**filter_params)
+
+    all_clean_maps = []
+    all_clean_labels = []
+    all_info = []
+
+    for config in data_configs:
+        file_path = config["path"]
+        name = config.get("name", "unknown")
+
+        print(f"\n📁 {name} 로딩 중: {file_path}")
+
+        if not os.path.exists(file_path):
+            print(f"⚠️  파일 없음: {file_path}")
+            continue
+
+        try:
+            # 데이터 로드
+            data = np.load(file_path, allow_pickle=True)
+            maps = data['maps']
+            labels = data['ids'] if 'ids' in data else data['labels']
+
+            print(f"   원본: {len(maps)}개")
+
+            # numpy array로 변환
+            if not isinstance(maps, np.ndarray):
+                maps = np.array(maps)
+            
+            # object dtype 확인 (제품 내에서도 size 다를 수 있음)
+            if maps.dtype == object:
+                # 개별 처리 필요
+                print(f"   ⚠️  웨이퍼 크기가 다름 - 개별 처리")
+                is_batch_possible = False
+            else:
+                # 배치 처리 가능
+                is_batch_possible = True
+                maps = maps.astype(np.int32)
+            
+            clean_maps = []
+            clean_labels = []
+            info_list = []
+            filtered_count = 0
+
+            if is_batch_possible:
+                # ========== 제품 단위 배치 변환 ==========
+                multi_channel_maps = convert_to_multichannel(maps, n_categories=n_categories)
+                print(f"   배치 변환 완료: {multi_channel_maps.shape}")
+                
+                # 필터링은 개별 처리 (channel 0만)
+                for i in range(len(multi_channel_maps)):
+                    wm = multi_channel_maps[i]  # (13, H, W)
+                    label = labels[i]
+                    
+                    # NaN, Inf 처리
+                    if np.any(np.isnan(wm)) or np.any(np.isinf(wm)):
+                        wm = np.nan_to_num(wm, nan=0.0, posinf=1.0, neginf=0.0)
+                    
+                    # 필터링 적용 (channel 0에만)
+                    info = None
+                    wm_org = wm[0].copy()
+                    if use_filter and wm[0].sum() > 0:
+                        original_defects = wm[0].sum()
+                        
+                        if use_density_aware:
+                            wm[0], info = filter_obj.filter_single_map(wm[0])
+                        else:
+                            wm[0] = filter_obj.filter_single_map(wm[0])
+                        
+                        filtered_defects = wm[0].sum()
+                        if filtered_defects < original_defects:
+                            wm[0] = wm_org.copy()
+                            filtered_count += 1
+                    
+                    clean_maps.append(wm)
+                    clean_labels.append(label)
+                    info_list.append(info)
+            
+            else:
+                # ========== 개별 처리 ==========
+                for i, (wm, label) in enumerate(zip(maps, labels)):
+                    try:
+                        # numpy 변환
+                        if not isinstance(wm, np.ndarray):
+                            wm = np.array(wm)
+                        wm = wm.astype(np.int32)
+                        
+                        # 2D 검증
+                        if len(wm.shape) != 2 or wm.shape[0] == 0 or wm.shape[1] == 0:
+                            continue
+                        
+                        # 단일 웨이퍼 변환
+                        multi_wm = convert_to_multichannel(wm, n_categories=n_categories)
+                        
+                        # NaN, Inf 처리
+                        if np.any(np.isnan(multi_wm)) or np.any(np.isinf(multi_wm)):
+                            multi_wm = np.nan_to_num(multi_wm, nan=0.0, posinf=1.0, neginf=0.0)
+                        
+                        # 필터링 적용 (channel 0에만)
+                        info = None
+                        multi_wm_org = multi_wm[0].copy()
+                        if use_filter and multi_wm[0].sum() > 0:
+                            original_defects = multi_wm[0].sum()
+                            
+                            if use_density_aware:
+                                multi_wm[0], info = filter_obj.filter_single_map(multi_wm[0])
+                            else:
+                                multi_wm[0] = filter_obj.filter_single_map(multi_wm[0])
+                            
+                            filtered_defects = multi_wm[0].sum()
+                            if filtered_defects < original_defects:
+                                multi_wm[0] = multi_wm_org.copy()
+                                filtered_count += 1
+                        
+                        clean_maps.append(multi_wm)
+                        clean_labels.append(label)
+                        info_list.append(info)
+                        
+                    except Exception as e:
+                        continue
+
+            success_rate = len(clean_maps) / len(maps) * 100 if len(maps) > 0 else 0
+            print(f"   정리됨: {len(clean_maps)}개 ({success_rate:.1f}%)")
+            if use_filter and filtered_count > 0:
+                print(f"   필터링됨: {filtered_count}개 ({filtered_count/len(clean_maps)*100:.1f}%)")
+
+            all_clean_maps.extend(clean_maps)
+            all_clean_labels.extend(clean_labels)
+            all_info.extend(info_list)
+
+        except Exception as e:
+            print(f"❌ {name} 로딩 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    print(f"\n{'='*60}")
+    print(f"✅ 전체 정리 완료: {len(all_clean_maps)}개")
+    print(f"   Shape per sample: ({n_channels}, H, W) - H, W는 제품별 상이")
+    print(f"{'='*60}")
+    
+    return all_clean_maps, all_clean_labels, all_info
+
+
+class MultiSizeWaferDataset(Dataset):
+    """인덱스를 함께 반환하는 Dataset"""
+
+    def __init__(self, wafer_maps, labels, target_size=(128, 128), 
+                 use_filter=False, filter_on_the_fly=False, filter_params=None,
+                 use_density_aware=False, is_training=False, use_augmentation=False):
+        """
+        Args:
+            wafer_maps: 웨이퍼맵 리스트
+            labels: 라벨 리스트
+            target_size: 리사이즈 타겟 크기
+            use_filter: 필터링 사용 여부
+            filter_on_the_fly: True면 __getitem__ 시마다 필터링 (느림, 메모리 절약)
+                              False면 초기화 시 모두 필터링 (빠름, 메모리 사용)
+            filter_params: 필터 파라미터
+            use_density_aware: True면 밀도 기반 적응형 필터 사용 (권장!)
+        """
+        self.wafer_maps = []
+        self.labels = []
+        self.original_indices = []
+        self.target_size = target_size
+        self.use_filter = use_filter
+        self.filter_on_the_fly = filter_on_the_fly
+        self.use_density_aware = use_density_aware
+        self.is_training = is_training
+        self.use_augmentation = use_augmentation
+
+        # 필터 초기화
+        if use_filter:
+            if use_density_aware:
+                self.filter_obj = DensityAwareWaferMapFilter()
+            else:
+                if filter_params is None:
+                    filter_params = {
+                        'min_component_size': 5,
+                        'opening_kernel_size': 1,
+                        'closing_kernel_size': 5,
+                        'edge_preserve_strength': 0.9
+                    }
+                self.filter_obj = WaferMapFilter(**filter_params)
+        
+        print(f"🛡️  Dataset 생성 중...")
+        if use_filter and not filter_on_the_fly:
+            print(f"   사전 필터링 적용 중...")
+
+        for idx, (wm, label) in enumerate(zip(wafer_maps, labels)):
+            # 🔴 Shape 검증 수정: (C, H, W) 형식
+            if (isinstance(wm, np.ndarray) and
+                wm.dtype == np.float32 and
+                len(wm.shape) == 3 and      # (C, H, W)
+                wm.shape[0] > 0 and         # C > 0
+                wm.shape[1] > 0 and         # H > 0
+                wm.shape[2] > 0):           # W > 0
+
+                # 사전 필터링 (filter_on_the_fly=False인 경우)
+                # Channel 0에만 적용
+                if use_filter and not filter_on_the_fly:
+                    if wm[0].sum() > 0:
+                        original_defects = wm[0].sum()
+                        
+                        if use_density_aware:
+                            wm[0], info = self.filter_obj.filter_single_map(wm[0])
+                        else:
+                            wm[0] = self.filter_obj.filter_single_map(wm[0])
+                        
+                        # 너무 많이 제거되면 스킵
+                        if wm[0].sum() < original_defects * 0.2:
+                            continue
+                
+                self.wafer_maps.append(wm)
+                self.labels.append(label)
+                self.original_indices.append(idx)
+
+        print(f"   최종 Dataset: {len(self.wafer_maps)}개")
+
+    def __len__(self):
+        return len(self.wafer_maps)
+
+    def __getitem__(self, idx):
+        wafer_map = self.wafer_maps[idx].copy()  # (C, H, W) - already multi-channel
+        label = self.labels[idx]
+        original_idx = self.original_indices[idx]
+
+        # On-the-fly 필터링 (filter_on_the_fly=True인 경우)
+        # Note: 이미 prepare_clean_data에서 필터링 했으므로 보통은 skip
+        if self.use_filter and self.filter_on_the_fly:
+            # Channel 0에만 필터링 적용
+            if wafer_map[0].sum() > 0:
+                if self.use_density_aware:
+                    wafer_map[0], _ = self.filter_obj.filter_single_map(wafer_map[0])
+                else:
+                    wafer_map[0] = self.filter_obj.filter_single_map(wafer_map[0])
+
+        # 안전한 전처리
+        # wafer_map: (C, H, W) numpy array → (C, target_H, target_W) tensor
+        tensor = torch.tensor(wafer_map, dtype=torch.float32)  # (C, H, W)
+        
+        # Resize
+        # F.interpolate expects (B, C, H, W), so add batch dim
+        tensor_4d = tensor.unsqueeze(0)  # (1, C, H, W)
+        resized = F.interpolate(tensor_4d, size=self.target_size, mode='bilinear', align_corners=False)
+        resized = resized.squeeze(0)  # (C, target_H, target_W)
+
+        # 🔴 Augmentation 적용 (training 시에만!)
+        if self.is_training and self.use_augmentation:
+            resized_aug = self._apply_augmentation(resized)
+        else:
+            resized_aug = None
+
+        return resized, resized_aug, label, original_idx
+    
+    def _apply_augmentation(self, tensor):
+        """
+        회전 불변성을 위한 Augmentation
+        D4 Dihedral group의 8가지 변환 중 하나를 균등하게 선택
+        
+        Args:
+            tensor: (C, H, W) - multi-channel
+        
+        Returns:
+            tensor: (C, H, W) - augmented
+        """
+        # 8가지 변환 중 하나를 균등하게 선택
+        transform_id = torch.randint(0, 8, (1,)).item()
+        
+        if transform_id == 0:
+            return tensor  # Identity (변환 없음)
+        elif transform_id == 1:
+            return torch.rot90(tensor, 1, dims=[1, 2])  # 90도 회전
+        elif transform_id == 2:
+            return torch.rot90(tensor, 2, dims=[1, 2])  # 180도 회전
+        elif transform_id == 3:
+            return torch.rot90(tensor, 3, dims=[1, 2])  # 270도 회전
+        elif transform_id == 4:
+            return torch.flip(tensor, dims=[2])  # 좌우 반전
+        elif transform_id == 5:
+            return torch.flip(tensor, dims=[1])  # 상하 반전
+        elif transform_id == 6:
+            # 90도 회전 + 좌우 반전 (대각선 대칭)
+            return torch.flip(torch.rot90(tensor, 1, dims=[1, 2]), dims=[2])
+        elif transform_id == 7:
+            # 90도 회전 + 상하 반전 (다른 대각선 대칭)
+            return torch.flip(torch.rot90(tensor, 1, dims=[1, 2]), dims=[1])
+
+
+def collate_fn(batch):
+    """인덱스를 포함한 collate 함수
+    + 문제 데이터를 자동으로 필터링하는 collate 함수
+    + 빈 맵(모두 0)도 제거
+    + Multi-channel 지원"""
+
+    safe_data = []
+    safe_data_aug = []
+    safe_labels = []
+    safe_indices = []
+    has_aug = True
+
+    for data, data_aug, label, original_idx in batch:
+        try:
+            # Shape 검증: (C, H, W)
+            if (isinstance(data, torch.Tensor) and
+                data.dtype == torch.float32 and
+                len(data.shape) == 3 and  # (C, H, W)
+                data.shape[0] > 0 and     # C > 0
+                data.shape[1] > 0 and     # H > 0
+                data.shape[2] > 0):       # W > 0
+
+                safe_data.append(data)
+                safe_data_aug.append(data_aug)
+                safe_labels.append(label)
+                safe_indices.append(original_idx)
+
+                # 첫 번째 샘플로 augmentation 여부 판단
+                if len(safe_data) == 1:
+                    has_aug = (data_aug is not None)
+
+        except:
+            continue
+
+    if len(safe_data) == 0:
+        # 모든 샘플이 문제인 경우 더미 배치 반환
+        # Multi-channel dummy
+        dummy = torch.zeros((1, 13, 128, 128), dtype=torch.float32)
+        return dummy, None, ["dummy"], [0]
+
+    batch_data = torch.stack(safe_data)
+    
+    if has_aug:
+        batch_data_aug = torch.stack(safe_data_aug)
     else:
-        raise ValueError(f"Invalid augmentation_type: {augmentation_type}")
+        batch_data_aug = None
+
+    return batch_data, batch_data_aug, safe_labels, safe_indices
 
 
-def test_batch_augmentation():
+
+def get_safe_num_workers(default=4):
     """
-    BatchBYOLAugmentation 테스트 및 기존 BYOLAugmentation과 동등성/성능 비교
+    가용 RAM에 따라 안전한 num_workers 결정
     """
-    import time
+    available_gb = psutil.virtual_memory().available / (1024**3)
+    if available_gb < 8:
+        num_workers = 0
+    elif available_gb < 12:
+        num_workers = 2
+    else:
+        num_workers = default
+    print(f"   num_workers: {num_workers} (가용 RAM: {available_gb:.1f}GB)")
+    return num_workers
 
-    print("=" * 60)
-    print("BatchBYOLAugmentation 테스트")
-    print("=" * 60)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
+def recreate_dataloaders(train_dataset, valid_dataset, batch_size, num_workers, drop_last=True):
+    """
+    DataLoader worker 오류 발생 시 num_workers를 줄여서 재생성
+    """
+    pin_memory = (num_workers > 0)
+    print(f"   🔄 DataLoader 재생성 중... num_workers={num_workers}")
 
-    # 테스트 데이터: 29채널 (13 spatial + 16 radial)
-    B, C, H, W = 128, 29, 128, 128
-    n_spatial = 13
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last
+    )
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last
+    )
+    return train_loader, valid_loader
 
-    # spatial 채널에만 defect 생성
-    x = torch.zeros(B, C, H, W, device=device)
-    x[:, :n_spatial] = (torch.rand(B, n_spatial, H, W, device=device) > 0.85).float()
-    # radial 채널에 임의의 값 (positional encoding 시뮬레이션)
-    x[:, n_spatial:] = torch.rand(B, C - n_spatial, H, W, device=device) * 0.5
 
-    # ========== 1. 기본 동작 테스트 ==========
-    print("\n[1] 기본 동작 테스트")
-    batch_aug = get_batch_byol_augmentation('strong', n_spatial_channels=n_spatial)
 
-    view1 = batch_aug(x)
-    view2 = batch_aug(x)
+def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128), test_size=0.2, 
+                        use_filter=True, filter_on_the_fly=False, filter_params=None, 
+                        use_density_aware=False, use_augmentation=False, drop_last=True):
+    
+    print("\n🔧 안전한 DataLoader 생성")
+    print("="*40)
 
-    print(f"   Input shape:  {x.shape}")
-    print(f"   View1 shape:  {view1.shape}")
-    print(f"   View2 shape:  {view2.shape}")
-    assert view1.shape == x.shape, "Shape 불일치!"
-    assert view2.shape == x.shape, "Shape 불일치!"
-    print("   ✅ Shape 검증 통과")
+    if use_filter:
+        if use_density_aware:
+            mode = "Density-Aware (밀도 기반 적응형)"
+        elif filter_on_the_fly:
+            mode = "On-the-fly"
+    else:
+        mode = "Pre-filtering"
+    print(f"   필터링 모드: {mode}")
 
-    # ========== 2. Radial 채널 보존 검증 ==========
-    print("\n[2] Radial 채널 보존 검증")
-    # C4 회전은 radial 채널도 회전시키므로, 값 자체가 보존되진 않음
-    # 하지만 defect dropout은 radial에 영향 주면 안 됨
-    # → dropout만 적용해서 검증
-    dropout_only = BatchBYOLAugmentation(
-        use_d4=False,
-        use_defect_dropout=True,
-        defect_dropout_prob=1.0,  # 100% 적용
-        defect_dropout_rate=(0.5, 0.5),
-        n_spatial_channels=n_spatial,
+    # 🔹 train/valid 분할을 먼저 수행
+    train_indices, valid_indices = train_test_split(
+        range(len(wafer_maps)), test_size=test_size, random_state=42
+    )
+    
+    # 🔹 분할된 데이터로 train/valid 데이터 생성
+    train_maps = [wafer_maps[i] for i in train_indices]
+    train_labels = [labels[i] for i in train_indices]
+    
+    valid_maps = [wafer_maps[i] for i in valid_indices]
+    valid_labels = [labels[i] for i in valid_indices]
+
+    # 🔹 별도의 dataset 객체 생성
+    train_dataset = MultiSizeWaferDataset(
+        train_maps, train_labels, 
+        target_size=target_size,
+        use_filter=use_filter,
+        filter_on_the_fly=filter_on_the_fly,
+        filter_params=filter_params,
+        use_density_aware=use_density_aware,
+        is_training=True,  # 🔹 train은 True
+        use_augmentation=use_augmentation
+    )
+    
+    valid_dataset = MultiSizeWaferDataset(
+        valid_maps, valid_labels, 
+        target_size=target_size,
+        use_filter=use_filter,
+        filter_on_the_fly=filter_on_the_fly,
+        filter_params=filter_params,
+        use_density_aware=use_density_aware,
+        is_training=False,  # 🔹 valid은 False
+        use_augmentation=False  # 🔹 항상 False
     )
 
-    x_dropped = dropout_only(x)
-    radial_before = x[:, n_spatial:].sum().item()
-    radial_after = x_dropped[:, n_spatial:].sum().item()
-    spatial_before = x[:, :n_spatial].sum().item()
-    spatial_after = x_dropped[:, :n_spatial].sum().item()
+    print(f"   Train: {len(train_dataset)}개 (Augmentation: {use_augmentation})")
+    print(f"   Valid: {len(valid_dataset)}개 (Augmentation: False Fixed)")
 
-    print(f"   Spatial defects:  {spatial_before:.0f} → {spatial_after:.0f} (감소해야 함)")
-    print(f"   Radial channels:  {radial_before:.4f} → {radial_after:.4f} (동일해야 함)")
-    assert abs(radial_before - radial_after) < 1e-4, "Radial 채널이 변경됨!"
-    assert spatial_after < spatial_before, "Spatial dropout이 적용되지 않음!"
-    print("   ✅ Radial 채널 보존 검증 통과")
+    _num_workers = get_safe_num_workers(default=4)
+    _pin_memory = (_num_workers > 0)
 
-    # ========== 3. C4 회전 분포 검증 ==========
-    print("\n[3] C4 회전 분포 검증")
-    rotation_only = BatchBYOLAugmentation(
-        use_d4=True,
-        use_c4_only=True,
-        use_defect_dropout=False,
-        n_spatial_channels=n_spatial,
+    # DataLoader 생성
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=_num_workers,
+        pin_memory=_pin_memory,
+        drop_last=drop_last
     )
-    # 비대칭 패턴 생성하여 회전 감지
-    x_asym = torch.zeros(1000, C, H, W, device=device)
-    x_asym[:, 0, 0:10, 0:10] = 1.0  # 좌상단에만 defect
 
-    x_rotated = rotation_only(x_asym)
-
-    # 4개 코너 defect 분포 확인
-    top_left = (x_rotated[:, 0, 0:10, 0:10].sum(dim=(1, 2)) > 0).float().mean().item()
-    top_right = (x_rotated[:, 0, 0:10, -10:].sum(dim=(1, 2)) > 0).float().mean().item()
-    bot_left = (x_rotated[:, 0, -10:, 0:10].sum(dim=(1, 2)) > 0).float().mean().item()
-    bot_right = (x_rotated[:, 0, -10:, -10:].sum(dim=(1, 2)) > 0).float().mean().item()
-
-    print(f"   좌상: {top_left:.2f}, 우상: {top_right:.2f}, 좌하: {bot_left:.2f}, 우하: {bot_right:.2f}")
-    print(f"   (각 ~0.25 기대)")
-    # 각 코너가 대략 0.25 ± 0.05 범위인지 확인
-    for name, val in [("좌상", top_left), ("우상", top_right), ("좌하", bot_left), ("우하", bot_right)]:
-        assert 0.15 < val < 0.35, f"{name} 분포 이상: {val:.3f}"
-    print("   ✅ C4 회전 균등 분포 검증 통과")
-
-    # ========== 4. 성능 비교 (vs for-loop) ==========
-    print("\n[4] 성능 비교")
-
-    # 배치 augmentation
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    start = time.time()
-    for _ in range(50):
-        v1 = batch_aug(x)
-        v2 = batch_aug(x)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    batch_time = time.time() - start
-
-    # for-loop augmentation (기존 방식 시뮬레이션)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    start = time.time()
-    for _ in range(50):
-        v1_list, v2_list = [], []
-        for i in range(B):
-            # C4 rotation
-            k = random.randint(0, 3)
-            v1_i = torch.rot90(x[i], k=k, dims=(-2, -1)).clone()
-            k = random.randint(0, 3)
-            v2_i = torch.rot90(x[i], k=k, dims=(-2, -1)).clone()
-            v1_list.append(v1_i)
-            v2_list.append(v2_i)
-        v1_loop = torch.stack(v1_list)
-        v2_loop = torch.stack(v2_list)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    loop_time = time.time() - start
-
-    print(f"   Batch augmentation:    {batch_time:.3f}초 (50 iterations)")
-    print(f"   For-loop augmentation: {loop_time:.3f}초 (50 iterations)")
-    print(f"   속도 향상: {loop_time / batch_time:.1f}x")
-
-    # ========== 5. D4 모드 테스트 ==========
-    print("\n[5] D4 모드 테스트")
-    d4_aug = BatchBYOLAugmentation(
-        use_d4=True,
-        use_c4_only=False,
-        use_defect_dropout=False,
-        n_spatial_channels=n_spatial,
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=_num_workers,
+        pin_memory=_pin_memory,
+        drop_last=drop_last
     )
-    view_d4 = d4_aug(x)
-    print(f"   D4 view shape: {view_d4.shape}")
-    assert view_d4.shape == x.shape
-    print("   ✅ D4 모드 검증 통과")
 
-    # ========== 6. weak/medium 모드 테스트 ==========
-    print("\n[6] weak/medium 모드 테스트")
-    for mode in ['weak', 'medium', 'strong']:
-        aug = get_batch_byol_augmentation(mode, n_spatial_channels=n_spatial)
-        view = aug(x[:4])
-        print(f"   {mode}: shape={view.shape}, defect_dropout={aug.use_defect_dropout}")
-    print("   ✅ 모든 모드 검증 통과")
+    print(f"   Train 배치: {len(train_loader)}개 / Valid 배치: {len(valid_loader)}개")
 
-    print("\n" + "=" * 60)
-    print("✅ 모든 테스트 통과!")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    test_batch_augmentation()
+    return train_loader, valid_loader

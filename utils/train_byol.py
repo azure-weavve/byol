@@ -12,6 +12,26 @@ PyTorch 1.4.0 compatible
 import torch
 import torch.nn as nn
 import time
+import torch.nn.functional as F
+
+
+
+def compute_uniformity_loss(features, t=2):
+    """
+    Uniformity loss: latent space에서 샘플들이 균등하게 분포하도록 강제
+    Wang & Isola (2020)
+    
+    Args:
+        features: [batch_size, dim] — projector output
+        t: temperature (default: 2)
+    Returns:
+        loss: scalar
+    """
+    # L2 normalize
+    z = F.normalize(features, dim=1)
+    # 모든 쌍의 squared L2 distance
+    sq_dist = torch.pdist(z, p=2).pow(2)
+    return sq_dist.mul(-t).exp().mean().log()
 
 
 def compute_variance_loss(features):
@@ -142,11 +162,13 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
     variance_type = variance_config.get('type', 'original')
     variance_weight = variance_config.get('weight', 0.0)
     covariance_weight = variance_config.get('covariance_weight', 0.0)
+    uniformity_weight = variance_config.get('uniformity_weight', 0.0)
 
     total_loss = 0.0
     total_byol_loss = 0.0
     total_var_loss = 0.0
     total_cov_loss = 0.0  # 기존 total_var_loss 아래에 추가
+    total_uni_loss = 0.0  # 초기화 (루프 밖 상단에)
     total_feat_std = 0.0
     total_cos_sim = 0.0
     total_batches = 0
@@ -214,6 +236,12 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
             else: 
                 cov_loss = torch.tensor(0.0, device=device)
 
+            # uniformity_loss
+            if uniformity_weight > 0:
+                uni_loss = compute_uniformity_loss(encoder_features)
+            else:
+                uni_loss = torch.tensor(0.0, device=device)
+
             # Cosine similarity (monitoring용)
             with torch.no_grad(): 
                 normalized = encoder_features / (encoder_features.norm(dim=1, keepdim=True) + 1e-8) 
@@ -230,10 +258,11 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
                 total_cos_sim += avg_cos_sim_batch
 
             # Total loss
-            total_loss_batch = byol_loss + variance_weight * var_loss + covariance_weight * cov_loss
+            total_loss_batch = byol_loss + (variance_weight * var_loss) + (covariance_weight * cov_loss) - (uniformity_weight * uni_loss)
         else:
             var_loss = torch.tensor(0.0, device=device)
             cov_loss = torch.tensor(0.0, device=device)  # 🆕
+            uni_loss = torch.tensor(0.0, device=device)
             current_std = 0.0
             avg_cos_sim_batch = 0.0
             byol_loss, encoder_features, projector_features = model(
@@ -252,7 +281,8 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
         total_loss += total_loss_batch.item()
         total_byol_loss += byol_loss.item()
         total_var_loss += var_loss.item()
-        total_cov_loss += cov_loss.item()  # total_var_loss 아래에 추가
+        total_cov_loss += cov_loss.item()
+        total_uni_loss += uni_loss.item()
         total_batches += 1
 
         # Print progress
@@ -263,6 +293,7 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
                       f"BYOL: {byol_loss.item():.4f}, "
                       f"Var: {var_loss.item():.4f}, "
                       f"Cov: {cov_loss.item():.4f}, "
+                      f"Uni: {uni_loss.item():.4f}, "
                       f"FeatStd: {current_std:.4f}, "
                       f"Tau: {tau:.4f}")
             else:
@@ -274,11 +305,13 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
     avg_byol_loss = total_byol_loss / total_batches
     avg_var_loss = total_var_loss / total_batches
     avg_cov_loss = total_cov_loss / total_batches
+    avg_uni_loss = total_uni_loss / total_batches
     has_reg = (variance_weight > 0 or covariance_weight > 0)
     avg_feat_std = total_feat_std / total_batches if has_reg else 0.0
     avg_cos_sim = total_cos_sim / total_batches if has_reg else 0.0
+    total_uni_loss += uni_loss.item()  # 루프 안에 추가
     
-    return avg_total_loss, avg_byol_loss, avg_var_loss, avg_cov_loss, avg_feat_std, avg_cos_sim
+    return avg_total_loss, avg_byol_loss, avg_var_loss, avg_cov_loss, avg_uni_loss, avg_feat_std, avg_cos_sim
 
 
 def validate_byol_epoch(model, dataloader, device, augmentation, augmentation_strong=None, verbose=True):
@@ -341,7 +374,7 @@ def validate_byol_epoch(model, dataloader, device, augmentation, augmentation_st
     return avg_loss
 
 
-def extract_features(model, dataloader, device, use_target=True, verbose=True):
+def extract_features(model, dataloader, device, use_target=True, verbose=True, keep_images_n=0):
     """
     Extract features from all data
 
@@ -351,15 +384,18 @@ def extract_features(model, dataloader, device, use_target=True, verbose=True):
         device: torch device
         use_target: use target encoder (recommended)
         verbose: print progress
+        keep_images_n: 앞에서 n개 이미지를 CPU tensor로 저장해서 반환 (0이면 None 반환)
 
     Returns:
         features: (N, D) tensor of all features
         labels: (N,) tensor of labels (if available)
+        sample_images: (keep_images_n, C, H, W) tensor or None
     """
     model.eval()
 
     all_features = []
     all_labels = []
+    sample_images = [] if keep_images_n > 0 else None
 
     total_batches_count = len(dataloader)
 
@@ -381,11 +417,15 @@ def extract_features(model, dataloader, device, use_target=True, verbose=True):
                 images = data
                 labels = None
 
+            # sample_images 수집 (keep_images_n개 채울 때까지)
+            if sample_images is not None and len(sample_images) < keep_images_n:
+                remaining = keep_images_n - len(sample_images)
+                sample_images.append(images[:remaining].cpu())
+
             images = images.to(device)
 
             # Extract features
             features = model.get_embeddings(images, use_target=use_target)
-
             all_features.append(features.cpu())
             
             # ✅ 수정: labels를 올바르게 처리
@@ -415,17 +455,20 @@ def extract_features(model, dataloader, device, use_target=True, verbose=True):
     # Concatenate all features
     all_features = torch.cat(all_features, dim=0)
 
+    if sample_images is not None:
+        sample_images = torch.cat(sample_images, dim=0)[:keep_images_n]
+
     # ✅ 수정: labels 처리
     if len(all_labels) > 0:
         # 첫 번째 원소가 tensor인지 list인지 확인
         if isinstance(all_labels[0], torch.Tensor):
             all_labels = torch.cat(all_labels, dim=0)
-            return all_features, all_labels
+            return all_features, all_labels, sample_images
         else:
             # list of strings/mixed types
-            return all_features, all_labels
+            return all_features, all_labels, sample_images
     else:
-        return all_features, None
+        return all_features, None, sample_images
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, loss, filepath, best_val_loss=None, **kwargs):
@@ -591,7 +634,7 @@ def detect_collapse(features, threshold_std=0.01, threshold_cosine=0.99):
     return is_collapsed, info
 
 
-def log_training_info(epoch, train_loss, val_loss, learning_rate, tau, timing_info, mem, collapse_info=None):
+def log_training_info(epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss, uni_loss, learning_rate, tau, timing_info, mem, variance_config, collapse_info=None):
     """
     Log training information
 
@@ -605,14 +648,20 @@ def log_training_info(epoch, train_loss, val_loss, learning_rate, tau, timing_in
         collapse_info: collapse detection info (optional)
     """
     eval_time = f"{timing_info['evaluate']:.2f}s" if timing_info['evaluate'] is not None else "Not evaluated"
+    variance_weight=variance_config['weight']
+    covariance_weight=variance_config.get('covariance_weight', 0.0)
+    uniformity_weight=variance_config.get('uniformity_weight', 0.0)
+
     print(f"\n{'='*60}")
     print(f"Epoch {epoch+1} Summary")
     print(f"{'='*60}")
-    print(f"Train Loss: {train_loss:.6f} / Val Loss: {val_loss:.6f}")
+    print(f"Train Loss: {train_loss:.6f} / Val Loss: {val_loss:.6f} ")
+    print(f"  BYOL Loss: {byol_loss:.6f}, Var Loss: {var_loss:.6f}, Cov Loss: {cov_loss:.6f}, Uni Loss: {uni_loss:.6f}")
+    print(f"  BYOL Loss: {(byol_loss/train_loss)*100:.2f}%, Var Loss: {(var_loss*variance_weight)*100:.2f}%, Cov Loss: {(cov_loss*covariance_weight)*100:.2f}%, Uni Loss: {(uni_loss*uniformity_weight*-1)*100:.2f}%")
     print(f"Learning Rate: {learning_rate:.6e} / Tau (EMA): {tau:.6f}")
     print(f"Time:")
-    print(f"  Train: {timing_info['train']:.2f}s / Valid: {timing_info['validate']:.2f}s / Collapse Detection: {timing_info['collapse_detection']:.2f}s / Evaluate: {eval_time} Total: {timing_info['total']:.2f}s")
-    print(f"  Memory - Total: {mem.total / 1024**3:.1f} GB / Available: {mem.available / 1024**3:.1f} GB / Used: {mem.used / 1024**3:.1f} GB / Percent: {mem.percent}%")
+    print(f"  Train: {timing_info['train']:.2f}s / Valid: {timing_info['validate']:.2f}s / Collapse Detection: {timing_info['collapse_detection']:.2f}s / Evaluate: {eval_time} / Total: {timing_info['total']:.2f}s")
+    print(f"  Memory -> Total: {mem.total / 1024**3:.1f} GB / Available: {mem.available / 1024**3:.1f} GB / Used: {mem.used / 1024**3:.1f} GB / Percent: {mem.percent}%")
 
     if collapse_info is not None:
         print(f"\nCollapse Detection:")
@@ -691,4 +740,3 @@ if __name__ == "__main__":
         test_training_functions()
     except ImportError as e:
         print(f"Import error: {e}")
-        print("Run from project root with proper PYTHONPATH")
