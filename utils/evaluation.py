@@ -123,28 +123,20 @@ def evaluate_knn_consistency(model, sample_images, device, all_features=None,
 
             original_feature = all_features_np[global_idx]  # (D,)
 
-            # 원본의 k-NN 검색 (euclidean distance)
-            # all_features_np: (N_total, D), original_feature: (D,)
-            diffs = all_features_np - original_feature[np.newaxis, :]  # (N_total, D)
-            distances = np.sqrt(np.sum(diffs ** 2, axis=1))  # (N_total,)
-             # 자기 자신 제외하고 k개 선택
+            # 원본의 k-NN 검색
+            diffs = all_features_np - original_feature[np.newaxis, :]
+            distances = np.sqrt(np.sum(diffs ** 2, axis=1))
             distances[global_idx] = float('inf')
-            knn_indices = np.argpartition(distances, k)[:k]  # top-k 인덱스
-            # 각 회전 embedding이 k-NN 안에 있는지 확인
-            # "있다" = k-NN 중 가장 가까운 것과의 거리가 threshold 이하
-            # 대신 더 직접적인 방법: 회전 embedding과 k-NN feature들 간 최소 거리
-            # → 원본과 k-NN의 최대 거리보다 작으면 "포함"으로 판정
+            knn_indices = np.argpartition(distances, k)[:k]
             knn_max_dist = np.max(distances[knn_indices])
 
             n_found = 0
             for rot_emb in rotated_embeddings_np:
-                # 이 회전 embedding의 가장 가까운 이웃이 원본의 k-NN 안에 있는가?
-                # 또는 더 직접적으로: 이 회전 embedding이 원본의 k-NN 반경 안에 있는가?
                 rot_dist_to_original = np.sqrt(np.sum((rot_emb - original_feature) ** 2))
                 if rot_dist_to_original <= knn_max_dist:
                     n_found += 1
 
-            consistencies.append(n_found / 3.0)  # C4에서 원본 제외 3개
+            consistencies.append(n_found / 3.0)
 
             if (idx + 1) % 100 == 0:
                 print(f"  kNN Consistency: {idx+1}/{actual_n_samples} samples processed, "
@@ -299,41 +291,30 @@ def evaluate_retrieval(features, k=5, metric='euclidean', batch_size=256, ground
     return metrics
 
 
-def estimate_optimal_eps(features, min_samples=10, method='elbow'):
-    """
-    K-distance graph 기반 최적 eps 추정
-    당신의 latent space에 맞춤형
-    
-    Args:
-        features: (N, D) embeddings
-        min_samples: DBSCAN min_samples
-        method: 'elbow' or 'percentile'
-    
-    Returns:
-        eps: 추정된 eps 값
-    """
+def estimate_optimal_eps(features, min_samples=10, method='elbow', subsample_n=5000):
     from sklearn.neighbors import NearestNeighbors
     import numpy as np
-    
-    # K-distance graph 생성
+
+    # ✅ 서브샘플링으로 OOM 방지
+    N = len(features)
+    if N > subsample_n:
+        idx = np.random.choice(N, subsample_n, replace=False)
+        subsample = features[idx]
+    else:
+        subsample = features
+
     neighbors = NearestNeighbors(n_neighbors=min_samples)
-    neighbors_fit = neighbors.fit(features)
-    distances, indices = neighbors_fit.kneighbors(features)
-    
-    # min_samples번째 거리 추출 및 정렬
+    neighbors.fit(subsample)
+    distances, _ = neighbors.kneighbors(subsample)  # 5000×5000 → ~200MB
     k_distances = np.sort(distances[:, min_samples-1], axis=0)
-    
+
     if method == 'elbow':
-        # Elbow point 찾기 (2차 미분)
         second_derivative = np.diff(k_distances, n=2)
         elbow_idx = np.argmax(second_derivative)
         eps = k_distances[elbow_idx]
-        
     elif method == 'percentile':
-        # Percentile 기반 (더 보수적, 권장)
-        # 90 percentile = 대부분의 점을 포함하되 sparse 제거
         eps = np.percentile(k_distances, 70)
-    
+
     return eps, k_distances
 
 
@@ -390,9 +371,17 @@ def evaluate_clustering(features, min_cluster_size=50, min_samples=10):
 
     # ✅ k-distance 계산
     from sklearn.neighbors import NearestNeighbors
+    # neighbors = NearestNeighbors(n_neighbors=min_samples)
+    # neighbors.fit(features)
+    # distances, _ = neighbors.kneighbors(features)
+    # k_distances = np.sort(distances[:, min_samples-1])
+    subsample_n = min(5000, len(features))
+    subsample_idx = np.random.choice(len(features), subsample_n, replace=False)
+    subsample = features[subsample_idx]
+
     neighbors = NearestNeighbors(n_neighbors=min_samples)
-    neighbors.fit(features)
-    distances, _ = neighbors.kneighbors(features)
+    neighbors.fit(subsample)
+    distances, _ = neighbors.kneighbors(subsample)  # 5000×5000 → ~200MB
     k_distances = np.sort(distances[:, min_samples-1])
     
     # ✅ eps 후보 생성 (더 넓은 범위)
@@ -412,40 +401,70 @@ def evaluate_clustering(features, min_cluster_size=50, min_samples=10):
         non_noise_count = (labels != -1).sum()
         
         # Silhouette 계산 (가능한 경우)
-        sil = None
+        # sil = None
+        # if n_clusters >= 2 and non_noise_count >= 10:
+        #     try:
+        #         non_noise = labels[labels != -1]
+        #         clustered_features = features[labels != -1]
+        #         sil = silhouette_score(clustered_features, non_noise)
+        #     except:
+        #         sil = None
+        
+        # # Score 계산
+        # if sil is not None:
+        #     # 목표: n_clusters 15-40, noise < 15%, silhouette > 0.5
+        #     score = sil - 0.1 * abs(n_clusters - 25) / 25 - 0.3 * noise_ratio
+        # elif n_clusters >= 2:
+        #     # silhouette 없으면 클러스터 수와 noise만 고려
+        #     score = -abs(n_clusters - 25) / 25 - noise_ratio
+        # else:
+        #     score = -999  # 클러스터가 1개 이하면 최악
+
+        ch = None
         if n_clusters >= 2 and non_noise_count >= 10:
             try:
                 non_noise = labels[labels != -1]
                 clustered_features = features[labels != -1]
-                sil = silhouette_score(clustered_features, non_noise)
+                ch = calinski_harabasz_score(clustered_features, non_noise)
             except:
-                sil = None
-        
-        # Score 계산
-        if sil is not None:
-            # 목표: n_clusters 15-40, noise < 15%, silhouette > 0.5
-            score = sil - 0.1 * abs(n_clusters - 25) / 25 - 0.3 * noise_ratio
+                ch = None
+
+        # Score 계산 (n_clusters 목표치 제거)
+        if ch is not None:
+            score = np.log1p(ch) - 0.3 * noise_ratio
         elif n_clusters >= 2:
-            # silhouette 없으면 클러스터 수와 noise만 고려
-            score = -abs(n_clusters - 25) / 25 - noise_ratio
+            score = -noise_ratio
         else:
-            score = -999  # 클러스터가 1개 이하면 최악
+            score = -999
         
+        # all_results.append({
+        #     'percentile': percentile,
+        #     'eps': eps,
+        #     'labels': labels,
+        #     'n_clusters': n_clusters,
+        #     'noise_ratio': noise_ratio,
+        #     'silhouette': sil,
+        #     'score': score
+        # })
         all_results.append({
             'percentile': percentile,
             'eps': eps,
             'labels': labels,
             'n_clusters': n_clusters,
             'noise_ratio': noise_ratio,
-            'silhouette': sil,
+            'ch': ch,
             'score': score
         })
         
         # 출력
-        sil_str = f"{sil:.4f}" if sil is not None else "N/A"
+        # sil_str = f"{sil:.4f}" if sil is not None else "N/A"
+        # print(f"percentile={percentile:2d}: eps={eps:.4f}, "
+        #       f"clusters={n_clusters:2d}, noise={noise_ratio:5.1%}, "
+        #       f"silhouette={sil_str}, score={score:7.4f}")
+        ch_str = f"{ch:.1f}" if ch is not None else "N/A"
         print(f"percentile={percentile:2d}: eps={eps:.4f}, "
-              f"clusters={n_clusters:2d}, noise={noise_ratio:5.1%}, "
-              f"silhouette={sil_str}, score={score:7.4f}")
+            f"clusters={n_clusters:2d}, noise={noise_ratio:5.1%}, "
+            f"ch={ch_str}, score={score:7.4f}")
     
     print("─" * 80)
     
@@ -461,8 +480,10 @@ def evaluate_clustering(features, min_cluster_size=50, min_samples=10):
         print("    2. Need to adjust min_samples or eps range")
         print("    3. Data might have very few distinct patterns")
     
+    # print(f"\n✅ Selected: eps={best['eps']:.4f}, clusters={best['n_clusters']}, "
+    #       f"noise={best['noise_ratio']:.1%}, silhouette={best['silhouette']}")
     print(f"\n✅ Selected: eps={best['eps']:.4f}, clusters={best['n_clusters']}, "
-          f"noise={best['noise_ratio']:.1%}, silhouette={best['silhouette']}")
+      f"noise={best['noise_ratio']:.1%}, ch={best['ch']}")
     
     labels = best['labels']
     
@@ -592,7 +613,8 @@ def evaluate_cluster_consistency_d4(model, test_samples, device, min_cluster_siz
             embeddings = model.get_embeddings(c4_batch, use_target=True)  # (4, D)
 
             all_embeddings.append(embeddings.cpu())
-            group_ids.extend([i] * 4)  # Group ID for each transformation (C4)
+            group_ids.extend([i] * 4)
+
     # Concatenate all embeddings
     all_embeddings = torch.cat(all_embeddings, dim=0)  # (N*4, D)
 
@@ -685,15 +707,19 @@ def find_optimal_dbscan_params(features, min_samples_list=[5, 10, 15],
     여러 파라미터 조합 테스트
     """
     results = []
+
+    # ✅ 서브샘플링으로 OOM 방지
+    subsample_n = min(5000, len(features))
+    idx = np.random.choice(len(features), subsample_n, replace=False)
+    subsample = features[idx]
     
     for min_samples in min_samples_list:
         for percentile in percentiles:
-            eps, _ = estimate_optimal_eps(features, min_samples, method='percentile')
-            # 수동으로 percentile 적용
+            
             from sklearn.neighbors import NearestNeighbors
             neighbors = NearestNeighbors(n_neighbors=min_samples)
-            neighbors_fit = neighbors.fit(features)
-            distances, _ = neighbors_fit.kneighbors(features)
+            neighbors.fit(subsample)
+            distances, _ = neighbors.kneighbors(subsample)
             k_distances = np.sort(distances[:, min_samples-1], axis=0)
             eps = np.percentile(k_distances, percentile)
             

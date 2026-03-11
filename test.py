@@ -1,612 +1,744 @@
+"""
+Training loop for BYOL
+
+Functions:
+- train_byol_epoch: single epoch training
+- validate_byol_epoch: validation
+- train_byol: full training pipeline
+
+PyTorch 1.4.0 compatible
+"""
+
 import torch
+import torch.nn as nn
+import time
 import torch.nn.functional as F
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-import os
-from utils.wafermap_filter import WaferMapFilter
-from utils.density_aware_filter import DensityAwareWaferMapFilter
-from utils.region_aware_filter import RegionAwareWaferMapFilter
-import psutil
 
 
-def convert_to_multichannel(wafer_maps, n_categories=12):
+
+def compute_uniformity_loss(features, t=2):
     """
-    정수 라벨 배열을 multi-channel one-hot 형식으로 변환 (배치 벡터화)
+    Uniformity loss: latent space에서 샘플들이 균등하게 분포하도록 강제
+    Wang & Isola (2020)
     
     Args:
-        wafer_maps: numpy array
-                   - 단일: (H, W) 정수 배열 (값 0~12)
-                   - 배치: (n, H, W) 정수 배열 (값 0~12)
-        n_categories: 불량 카테고리 개수 (기본값: 12)
-                     0은 non-wafer + good chip이므로 제외
-    
+        features: [batch_size, dim] — projector output
+        t: temperature (default: 2)
     Returns:
-        multi_channel: numpy array
-                      - 단일 입력: (n_categories+1, H, W)
-                      - 배치 입력: (n, n_categories+1, H, W)
-                      
-                      channel[0] = 불량 위치 (값 > 0)
-                      channel[1~12] = 각 카테고리별 위치 (값 == k)
+        loss: scalar
     """
-    # 단일 웨이퍼 처리 (H, W) → 배치 형태로 변환
-    single_input = False
-    if len(wafer_maps.shape) == 2:
-        single_input = True
-        wafer_maps = wafer_maps[np.newaxis, ...]  # (1, H, W)
-    
-    n, H, W = wafer_maps.shape
-    n_channels = n_categories + 1  # 13 channels (0: spatial, 1-12: categories)
-    
-    # 결과 배열 초기화
-    multi_channel = np.zeros((n, n_channels, H, W), dtype=np.float32)
-    
-    # Channel 0: 불량 위치 (값 > 0인 모든 위치)
-    multi_channel[:, 0, :, :] = (wafer_maps > 0).astype(np.float32)
-    
-    # Channel 1~12: 각 카테고리별 one-hot
-    for k in range(1, n_categories + 1):
-        multi_channel[:, k, :, :] = (wafer_maps == k).astype(np.float32)
-    
-    # 단일 입력이었으면 배치 차원 제거
-    if single_input:
-        multi_channel = multi_channel[0]  # (13, H, W)
-    
-    return multi_channel
+    # L2 normalize
+    z = F.normalize(features, dim=1)
+    # 모든 쌍의 squared L2 distance
+    sq_dist = torch.pdist(z, p=2).pow(2)
+    return sq_dist.mul(-t).exp().mean().log()
 
-def detect_n_categories(data_configs):
+
+def compute_variance_loss(features):
     """
-    데이터 파일들을 스캔하여 최대 카테고리 개수 자동 감지 (값 기반)
+    Feature variance를 유지하도록 regularization
     
     Args:
-        data_configs: [{"path": "...", "name": "..."}, ...]
+        features: [batch_size, dim]
     
     Returns:
-        max_category: 최대 카테고리 번호 (예: 12)
-                     0은 non-wafer + good chip이므로 카테고리에서 제외
+        loss: variance가 낮으면 패널티
     """
-    max_category = 0
+    # 각 dimension의 std 계산
+    std_per_dim = features.std(dim=0)  # (dim,)
     
-    for config in data_configs:
-        file_path = config["path"]
-        
-        if not os.path.exists(file_path):
-            print(f"⚠️  파일 없음: {file_path}")
-            continue
-        
-        try:
-            data = np.load(file_path, allow_pickle=True)
-            maps = data['maps']
-            
-            if len(maps) == 0:
-                continue
-            
-            # 샘플링하여 최대값 확인 (전체 스캔은 느릴 수 있음)
-            n_samples = min(100, len(maps))
-            sample_indices = np.linspace(0, len(maps)-1, n_samples, dtype=int)
-            
-            for idx in sample_indices:
-                sample = maps[idx]
-                
-                if not isinstance(sample, np.ndarray):
-                    sample = np.array(sample)
-                
-                sample_max = int(sample.max())
-                max_category = max(max_category, sample_max)
-            
-            print(f"✅ {config.get('name', 'unknown')}: 최대 카테고리 = {max_category}")
-                    
-        except Exception as e:
-            print(f"⚠️  {file_path} 감지 실패: {e}")
-            continue
+    # Std가 낮으면 loss 증가
+    # -log(std)를 사용하면 std가 0에 가까울수록 loss 무한대
+    variance_loss = -torch.log(std_per_dim.mean() + 1e-6)
     
-    print(f"📊 감지된 최대 카테고리: {max_category}")
-    return max_category
+    return variance_loss
 
-
-
-def prepare_clean_data(data_configs, use_filter=True, filter_params=None, 
-                       use_density_aware=False, use_region_aware=False):
+def compute_variance_loss_target_std(features, target_std=1.0, adaptive=False):
     """
-    여러 제품 데이터를 로드하고 완전히 정리 + 필터링 + Multi-channel 변환
+    Feature std를 target 값에 맞추는 loss
+    
+    Args:
+        features: [batch_size, dim]
+        target_std: 목표 std (default: 1.0)
+        adaptive: True면 dimension별로 다른 target 허용
+    
+    Returns:
+        loss: scalar
+        current_std: 현재 평균 std
+    """
+    # Dimension별 std 계산
+    std_per_dim = features.std(dim=0)  # (dim,)
+    
+    if adaptive:
+        # Dimension별로 조정 (일부 dim은 중요도 높음)
+        # 현재는 단순 평균
+        avg_std = std_per_dim.mean()
+    else:
+        avg_std = std_per_dim.mean()
+    
+    # MSE loss to target
+    loss = (avg_std - target_std) ** 2
+    
+    return loss, avg_std.item()
+
+
+def compute_variance_loss_robust(features, target_std=1.0, margin=0.1):
+    """
+    더 robust한 버전: margin 내에서는 패널티 없음
+    
+    target_std = 1.0, margin = 0.1이면
+    → 0.9 ~ 1.1 범위는 패널티 0
+    → 범위 밖이면 패널티
+    """
+    std_per_dim = features.std(dim=0)
+    avg_std = std_per_dim.mean()
+    
+    # Margin 밖이면 패널티
+    lower_bound = target_std - margin
+    upper_bound = target_std + margin
+    
+    if avg_std < lower_bound:
+        loss = (avg_std - lower_bound) ** 2
+    elif avg_std > upper_bound:
+        loss = (avg_std - upper_bound) ** 2
+    else:
+        loss = torch.tensor(0.0, device=features.device)
+    
+    return loss, avg_std.item()
+
+def compute_covariance_loss(features):
+    """
+    VICReg style covariance regularization
+    차원 간 상관관계를 제거하여 directional collapse 방지
+    
+    Args:
+        features: [batch_size, dim]
+    Returns:
+        loss: scalar
+    """
+    N, D = features.shape
+    
+    # 평균 제거
+    features_centered = features - features.mean(dim=0)
+    
+    # Covariance matrix (D, D)
+    cov = (features_centered.T @ features_centered) / max(N - 1, 1)
+    
+    # Off-diagonal 원소의 제곱합
+    diag = torch.diag(torch.diag(cov))
+    off_diag = cov - diag
+    
+    loss = (off_diag ** 2).sum() / D
+    
+    return loss
+
+
+def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, augmentation_strong=None, epoch=0, total_epochs=100, variance_config=None, verbose=True):
+    """
+    Train BYOL for one epoch
 
     Args:
-        data_configs: [{"path": "...", "name": "..."}, ...]
-        use_filter: 필터링 적용 여부
-        filter_params: 필터 파라미터 딕셔너리
-        use_density_aware: True면 밀도 기반 적응형 필터 사용
-        use_region_aware: True면 region-aware 필터 사용
+        model: BYOL model
+        dataloader: training data loader
+        optimizer: optimizer (e.g., AdamW)
+        device: torch device
+        tau: EMA momentum for this epoch
+        augmentation: augmentation function (BYOLAugmentation)
+        epoch: current epoch number
+        verbose: print progress
+        variance_config: {
+            'type': 'target_std',  # or 'target_std_robust'
+            'target_std': 1.0,
+            'margin': 0.1,         # for robust version
+            'weight': 0.2
+        }
 
     Returns:
-        clean_maps: List of (13, H, W) arrays (size 다를 수 있음)
-        clean_labels: List of labels
-        info: List of filter info dicts
+        avg_loss: average loss for the epoch
+        avg_cos_sim: average cosine similarity
     """
+    model.train()
 
-    print("="*60)
-    
-    # 카테고리 개수 자동 감지
-    n_categories = detect_n_categories(data_configs)
-    n_channels = n_categories + 1  # 13 channels
-    
-    mode_str = "밀도 기반 적응형" if use_density_aware else "일반"
-    print(f"🧹 데이터 완전 정리 시작" + (f" ({mode_str} 필터링 포함)" if use_filter else ""))
-    print(f"📊 Multi-channel format: {n_channels} channels (1 spatial + {n_categories} categories)")
-    print("="*60)
-    
-    # 필터 초기화
-    if use_filter:
-        if use_density_aware:
-            filter_obj = DensityAwareWaferMapFilter()
+    variance_type = variance_config.get('type', 'original')
+    variance_weight = variance_config.get('weight', 0.0)
+    covariance_weight = variance_config.get('covariance_weight', 0.0)
+    uniformity_weight = variance_config.get('uniformity_weight', 0.0)
+
+    total_loss = 0.0
+    total_byol_loss = 0.0
+    total_var_loss = 0.0
+    total_cov_loss = 0.0  # 기존 total_var_loss 아래에 추가
+    total_uni_loss = 0.0  # 초기화 (루프 밖 상단에)
+    total_feat_std = 0.0
+    total_cos_sim = 0.0
+    total_batches = 0
+
+    total_batches_count = len(dataloader)
+
+    for batch_idx, data in enumerate(dataloader):
+        # Get data (handle multiple return formats)
+        if isinstance(data, (list, tuple)):
+            if len(data) == 4:
+                # From dataloader_utils: (images, images_aug, labels, indices)
+                images = data[0]
+                # Ignore data[1] (augmented), data[2] (labels), data[3] (indices)
+                # BYOL will apply its own augmentation
+            else:
+                # Standard format: (images, labels) or just images
+                images = data[0] if len(data) > 0 else data
         else:
-            if filter_params is None:
-                filter_params = {
-                    'min_component_size': 5,
-                    'opening_kernel_size': 1,
-                    'closing_kernel_size': 5,
-                    'edge_preserve_strength': 0.9
-                }
-            filter_obj = WaferMapFilter(**filter_params)
+            images = data
 
-    all_clean_maps = []
-    all_clean_labels = []
-    all_info = []
+        images = images.to(device)
+        batch_size = images.size(0)
 
-    for config in data_configs:
-        file_path = config["path"]
-        name = config.get("name", "unknown")
+        # Generate two augmented views (batch vectorized)
+        view1 = augmentation(images) # weak (C4만 또는 약한 dropout)
+        if augmentation_strong is not None:
+            view2 = augmentation_strong(images) # strong (C4 + 강한 dropout)
+        else:
+            view2 = augmentation(images) # 기존과 동일 (symmetric)
 
-        print(f"\n📁 {name} 로딩 중: {file_path}")
+        # Forward pass
+        optimizer.zero_grad()
 
-        if not os.path.exists(file_path):
-            print(f"⚠️  파일 없음: {file_path}")
-            continue
+        # 1. BYOL loss (+ features for regularization)
+        if variance_weight >0 or covariance_weight > 0:
+            byol_loss, encoder_features, projector_features = model(
+                view1, view2, return_projections=True
+            )
 
-        try:
-            # 데이터 로드
-            data = np.load(file_path, allow_pickle=True)
-            maps = data['maps']
-            labels = data['ids'] if 'ids' in data else data['labels']
-
-            print(f"   원본: {len(maps)}개")
-
-            # numpy array로 변환
-            if not isinstance(maps, np.ndarray):
-                maps = np.array(maps)
-            
-            # object dtype 확인 (제품 내에서도 size 다를 수 있음)
-            if maps.dtype == object:
-                # 개별 처리 필요
-                print(f"   ⚠️  웨이퍼 크기가 다름 - 개별 처리")
-                is_batch_possible = False
+            # Variance loss — encoder output (512d)
+            if variance_weight > 0:
+                if variance_type == 'target_std':
+                    var_loss, current_std = compute_variance_loss_target_std(
+                        encoder_features, 
+                        target_std=variance_config.get('target_std', 1.0)
+                    )
+                elif variance_type == 'target_std_robust':
+                    var_loss, current_std = compute_variance_loss_robust(
+                        encoder_features, 
+                        target_std=variance_config.get('target_std', 1.0), 
+                        margin=variance_config.get('margin', 0.1)
+                    )
+                else:
+                    var_loss = compute_variance_loss(encoder_features)
+                    current_std = encoder_features.std(dim=0).mean().item()
             else:
-                # 배치 처리 가능
-                is_batch_possible = True
-                maps = maps.astype(np.int32)
+                var_loss = torch.tensor(0.0, device=device)
+                current_std = encoder_features.std(dim=0).mean().item()
             
-            clean_maps = []
-            clean_labels = []
-            info_list = []
-            filtered_count = 0
+            total_feat_std += current_std
 
-            if is_batch_possible:
-                # ========== 제품 단위 배치 변환 ==========
-                multi_channel_maps = convert_to_multichannel(maps, n_categories=n_categories)
-                print(f"   배치 변환 완료: {multi_channel_maps.shape}")
+            # Covariance loss — projector output (256d)
+            if covariance_weight > 0:
+                cov_loss = compute_covariance_loss(projector_features)
+            else: 
+                cov_loss = torch.tensor(0.0, device=device)
+
+            # uniformity_loss
+            if uniformity_weight > 0:
+                uni_loss = compute_uniformity_loss(encoder_features)
+            else:
+                uni_loss = torch.tensor(0.0, device=device)
+
+            # Cosine similarity (monitoring용)
+            with torch.no_grad(): 
+                normalized = encoder_features / (encoder_features.norm(dim=1, keepdim=True) + 1e-8) 
+                n_samples = min(100, encoder_features.size(0))
                 
-                # 필터링은 개별 처리 (channel 0만)
-                for i in range(len(multi_channel_maps)):
-                    wm = multi_channel_maps[i]  # (13, H, W)
-                    label = labels[i]
-                    
-                    # NaN, Inf 처리
-                    if np.any(np.isnan(wm)) or np.any(np.isinf(wm)):
-                        wm = np.nan_to_num(wm, nan=0.0, posinf=1.0, neginf=0.0)
-                    
-                    # 필터링 적용 (channel 0에만)
-                    info = None
-                    wm_org = wm[0].copy()
-                    if use_filter and wm[0].sum() > 0:
-                        original_defects = wm[0].sum()
-                        
-                        if use_density_aware:
-                            wm[0], info = filter_obj.filter_single_map(wm[0])
-                        else:
-                            wm[0] = filter_obj.filter_single_map(wm[0])
-                        
-                        filtered_defects = wm[0].sum()
-                        if filtered_defects < original_defects:
-                            wm[0] = wm_org.copy()
-                            filtered_count += 1
-                    
-                    clean_maps.append(wm)
-                    clean_labels.append(label)
-                    info_list.append(info)
-            
+                if n_samples >= 2: 
+                    indices = torch.randperm(encoder_features.size(0))[:n_samples] 
+                    sample_features = normalized[indices] 
+                    cos_sim_matrix = torch.mm(sample_features, sample_features.T) 
+                    mask = ~torch.eye(n_samples, dtype=torch.bool, device=device) 
+                    avg_cos_sim_batch = cos_sim_matrix[mask].mean().item() 
+                else: 
+                    avg_cos_sim_batch = 0.0 
+                total_cos_sim += avg_cos_sim_batch
+
+            # Total loss
+            total_loss_batch = byol_loss + (variance_weight * var_loss) + (covariance_weight * cov_loss) - (uniformity_weight * uni_loss)
+        else:
+            var_loss = torch.tensor(0.0, device=device)
+            cov_loss = torch.tensor(0.0, device=device)  # 🆕
+            uni_loss = torch.tensor(0.0, device=device)
+            current_std = 0.0
+            avg_cos_sim_batch = 0.0
+            byol_loss, encoder_features, projector_features = model(
+                view1, view2, return_projections=True
+            )
+            total_loss_batch = byol_loss
+
+        # Backward pass
+        total_loss_batch.backward()
+        optimizer.step()
+
+        # Update target network with EMA
+        model.update_target_network(tau=tau)
+
+        # Track metrics
+        total_loss += total_loss_batch.item()
+        total_byol_loss += byol_loss.item()
+        total_var_loss += var_loss.item()
+        total_cov_loss += cov_loss.item()
+        total_uni_loss += uni_loss.item()
+        total_batches += 1
+
+        # Print progress
+        if verbose and (batch_idx % 5 == 0 or batch_idx == total_batches_count - 1):
+            if variance_weight > 0:
+                print(f"Epoch {epoch+1} [Train] [{batch_idx+1}/{total_batches_count}] "
+                    f"Total: {total_loss_batch.item():.4f}, "
+                      f"BYOL: {byol_loss.item():.4f}, "
+                      f"Var: {var_loss.item():.4f}, "
+                      f"Cov: {cov_loss.item():.4f}, "
+                      f"Uni: {uni_loss.item():.4f}, "
+                      f"FeatStd: {current_std:.4f}, "
+                      f"Tau: {tau:.4f}")
             else:
-                # ========== 개별 처리 ==========
-                for i, (wm, label) in enumerate(zip(maps, labels)):
+                print(f"Epoch {epoch+1} [Train] [{batch_idx+1}/{total_batches_count}] "
+                    f"Loss: {total_loss_batch.item():.4f}")
+
+    # Calculate averages
+    avg_total_loss = total_loss / total_batches
+    avg_byol_loss = total_byol_loss / total_batches
+    avg_var_loss = total_var_loss / total_batches
+    avg_cov_loss = total_cov_loss / total_batches
+    avg_uni_loss = total_uni_loss / total_batches
+    has_reg = (variance_weight > 0 or covariance_weight > 0)
+    avg_feat_std = total_feat_std / total_batches if has_reg else 0.0
+    avg_cos_sim = total_cos_sim / total_batches if has_reg else 0.0
+    
+    return avg_total_loss, avg_byol_loss, avg_var_loss, avg_cov_loss, avg_uni_loss, avg_feat_std, avg_cos_sim
+
+
+def validate_byol_epoch(model, dataloader, device, augmentation, augmentation_strong=None, verbose=True):
+    """
+    Validate BYOL for one epoch
+
+    Args:
+        model: BYOL model
+        dataloader: validation data loader
+        device: torch device
+        augmentation: augmentation function
+        verbose: print progress
+
+    Returns:
+        avg_loss: average validation loss
+    """
+    model.eval()
+
+    total_loss = 0.0
+    total_batches = 0
+
+    total_batches_count = len(dataloader)
+
+    with torch.no_grad():
+        for batch_idx, data in enumerate(dataloader):
+            # Get data (handle multiple return formats)
+            if isinstance(data, (list, tuple)):
+                if len(data) == 4:
+                    # From dataloader_utils: (images, images_aug, labels, indices)
+                    images = data[0]
+                else:
+                    # Standard format: (images, labels) or just images
+                    images = data[0] if len(data) > 0 else data
+            else:
+                images = data
+
+            images = images.to(device)
+            batch_size = images.size(0)
+
+            # Generate two augmented views (batch vectorized)
+            view1 = augmentation(images)
+            if augmentation_strong is not None:
+                view2 = augmentation_strong(images)
+            else:
+                view2 = augmentation(images)
+
+            # Forward pass
+            loss = model(view1, view2)
+
+            # Track metrics
+            total_loss += loss.item()
+            total_batches += 1
+
+            # Print progress
+            if verbose and (batch_idx % 10 == 0 or batch_idx == total_batches_count - 1):
+                print(f"Validation [{batch_idx+1}/{total_batches_count}] Loss: {loss.item():.4f}")
+
+    avg_loss = total_loss / total_batches
+
+    return avg_loss
+
+
+def extract_features(model, dataloader, device, use_target=True, verbose=True, keep_images_n=0):
+    """
+    Extract features from all data
+
+    Args:
+        model: BYOL model
+        dataloader: data loader
+        device: torch device
+        use_target: use target encoder (recommended)
+        verbose: print progress
+        keep_images_n: 앞에서 n개 이미지를 CPU tensor로 저장해서 반환 (0이면 None 반환)
+
+    Returns:
+        features: (N, D) tensor of all features
+        labels: (N,) tensor of labels (if available)
+        sample_images: (keep_images_n, C, H, W) tensor or None
+    """
+    model.eval()
+
+    all_features = []
+    all_labels = []
+    sample_images = [] if keep_images_n > 0 else None
+
+    total_batches_count = len(dataloader)
+
+    with torch.no_grad():
+        for batch_idx, data in enumerate(dataloader):
+            # Get data (handle multiple return formats)
+            if isinstance(data, (list, tuple)):
+                if len(data) == 4:
+                    # From dataloader_utils: (images, images_aug, labels, indices)
+                    images = data[0]
+                    labels = data[2]  # labels는 list!
+                elif len(data) > 1:
+                    images = data[0]
+                    labels = data[1]
+                else:
+                    images = data[0] if len(data) > 0 else data
+                    labels = None
+            else:
+                images = data
+                labels = None
+
+            # sample_images 수집 (keep_images_n개 채울 때까지)
+            if sample_images is not None:
+                already_collected = sum(t.size(0) for t in sample_images)
+                if already_collected < keep_images_n:
+                    remaining = keep_images_n - already_collected
+                    sample_images.append(images[:remaining].cpu())
+
+            images = images.to(device)
+
+            # Extract features
+            features = model.get_embeddings(images, use_target=use_target)
+            all_features.append(features.cpu())
+            
+            # ✅ 수정: labels를 올바르게 처리
+            if labels is not None:
+                # labels가 list라면 tensor로 변환 필요
+                if isinstance(labels, list):
+                    # 숫자로 변환 가능하면 tensor로
                     try:
-                        # numpy 변환
-                        if not isinstance(wm, np.ndarray):
-                            wm = np.array(wm)
-                        wm = wm.astype(np.int32)
-                        
-                        # 2D 검증
-                        if len(wm.shape) != 2 or wm.shape[0] == 0 or wm.shape[1] == 0:
-                            continue
-                        
-                        # 단일 웨이퍼 변환
-                        multi_wm = convert_to_multichannel(wm, n_categories=n_categories)
-                        
-                        # NaN, Inf 처리
-                        if np.any(np.isnan(multi_wm)) or np.any(np.isinf(multi_wm)):
-                            multi_wm = np.nan_to_num(multi_wm, nan=0.0, posinf=1.0, neginf=0.0)
-                        
-                        # 필터링 적용 (channel 0에만)
-                        info = None
-                        multi_wm_org = multi_wm[0].copy()
-                        if use_filter and multi_wm[0].sum() > 0:
-                            original_defects = multi_wm[0].sum()
-                            
-                            if use_density_aware:
-                                multi_wm[0], info = filter_obj.filter_single_map(multi_wm[0])
-                            else:
-                                multi_wm[0] = filter_obj.filter_single_map(multi_wm[0])
-                            
-                            filtered_defects = multi_wm[0].sum()
-                            if filtered_defects < original_defects:
-                                multi_wm[0] = multi_wm_org.copy()
-                                filtered_count += 1
-                        
-                        clean_maps.append(multi_wm)
-                        clean_labels.append(label)
-                        info_list.append(info)
-                        
-                    except Exception as e:
-                        continue
+                        labels_tensor = torch.tensor(labels, dtype=torch.long)
+                        all_labels.append(labels_tensor)
+                    except (ValueError, TypeError):
+                        # 문자열 라벨이면 그냥 list로 유지
+                        all_labels.extend(labels)
+                elif isinstance(labels, torch.Tensor):
+                    all_labels.append(labels.cpu())
+                else:
+                    # 다른 형식이면 list로 추가
+                    if isinstance(labels, (list, tuple)):
+                        all_labels.extend(labels)
+                    else:
+                        all_labels.append(labels)
 
-            success_rate = len(clean_maps) / len(maps) * 100 if len(maps) > 0 else 0
-            print(f"   정리됨: {len(clean_maps)}개 ({success_rate:.1f}%)")
-            if use_filter and filtered_count > 0:
-                print(f"   필터링됨: {filtered_count}개 ({filtered_count/len(clean_maps)*100:.1f}%)")
+            # Print progress
+            if verbose and (batch_idx % 10 == 0 or batch_idx == total_batches_count - 1):
+                print(f"Extracting features [{batch_idx+1}/{total_batches_count}]")
 
-            all_clean_maps.extend(clean_maps)
-            all_clean_labels.extend(clean_labels)
-            all_info.extend(info_list)
+    # Concatenate all features
+    all_features = torch.cat(all_features, dim=0)
 
-        except Exception as e:
-            print(f"❌ {name} 로딩 실패: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+    if sample_images is not None:
+        sample_images = torch.cat(sample_images, dim=0)[:keep_images_n]
+
+    # ✅ 수정: labels 처리
+    if len(all_labels) > 0:
+        # 첫 번째 원소가 tensor인지 list인지 확인
+        if isinstance(all_labels[0], torch.Tensor):
+            all_labels = torch.cat(all_labels, dim=0)
+            return all_features, all_labels, sample_images
+        else:
+            # list of strings/mixed types
+            return all_features, all_labels, sample_images
+    else:
+        return all_features, None, sample_images
+
+
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, filepath, best_val_loss=None, **kwargs):
+    """
+    Save checkpoint
+
+    Args:
+        model: BYOL model
+        optimizer: optimizer
+        scheduler: learning rate scheduler (optional)
+        epoch: current epoch
+        loss: current loss
+        filepath: path to save checkpoint
+        best_val_loss: best validation loss so far (optional)  # 🔴 추가
+        **kwargs: additional info to save
+    """
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }
+
+    if scheduler is not None:
+        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+        
+    # 🔴 best_val_loss 저장
+    if best_val_loss is not None:
+        checkpoint['best_val_loss'] = best_val_loss
+
+    # Add any additional info
+    checkpoint.update(kwargs)
+
+    torch.save(checkpoint, filepath)
+    print(f"Checkpoint saved to {filepath}")
+
+
+def load_checkpoint(model, optimizer, scheduler, filepath, device):
+    """
+    Load checkpoint
+
+    Args:
+        model: BYOL model
+        optimizer: optimizer
+        scheduler: learning rate scheduler (optional)
+        filepath: path to checkpoint
+        device: torch device
+
+    Returns:
+        epoch: epoch to resume from
+        loss: loss at checkpoint
+        best_val_loss: best validation loss (if available)
+        best_composite: best composite score (if available)
+        pending_evaluation: whether evaluation was interrupted (if available)
+    """
+    checkpoint = torch.load(filepath, map_location=device)
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    epoch = checkpoint['epoch']
+    loss = checkpoint['loss']
+    best_val_loss = checkpoint.get('best_val_loss', float('inf'))  # 🔴 추가
+    best_composite = checkpoint.get('best_composite', -float('inf'))  # 추가
+    pending_evaluation = checkpoint.get('pending_evaluation', False)
+
+    print(f"Checkpoint loaded from {filepath}")
+    print(f"Resuming from epoch {epoch+1}, loss: {loss:.4f}, best_val_loss: {best_val_loss:.4f}, best_composite: {best_composite:.4f}")
+
+    if pending_evaluation:
+        print(f"  ⚠️ Pending evaluation detected for epoch {epoch+1}")
+
+    return epoch, loss, best_val_loss, best_composite, pending_evaluation  # 5개 반환
+
+
+class EarlyStopping:
+    """
+    Early stopping to stop training when validation loss doesn't improve
+    """
+    def __init__(self, patience=10, min_delta=0.0, mode='min'):
+        """
+        Args:
+            patience: number of epochs to wait before stopping
+            min_delta: minimum change to qualify as improvement
+            mode: 'min' or 'max'
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, score):
+        """
+        Args:
+            score: current metric value
+
+        Returns:
+            True if should stop training
+        """
+        if self.best_score is None:
+            self.best_score = score
+            return False
+
+        if self.mode == 'min':
+            improved = score < (self.best_score - self.min_delta)
+        else:
+            improved = score > (self.best_score + self.min_delta)
+
+        if improved:
+            self.best_score = score
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                return True
+
+        return False
+
+
+def detect_collapse(features, threshold_std=0.01, threshold_cosine=0.99):
+    """
+    Detect representation collapse
+
+    Args:
+        features: (B, D) feature tensor
+        threshold_std: minimum std for each dimension
+        threshold_cosine: maximum average cosine similarity
+
+    Returns:
+        is_collapsed: bool
+        info: dict with diagnostic info
+    """
+    # Compute statistics
+    feat_std = features.std(dim=0).mean().item()
+    feat_mean = features.mean(dim=0).mean().item()
+
+    # Normalize features
+    features_norm = features / (features.norm(dim=1, keepdim=True) + 1e-8)
+
+    # Compute pairwise cosine similarity
+    cos_sim_matrix = torch.mm(features_norm, features_norm.t())
+
+    # Average cosine similarity (excluding diagonal)
+    mask = ~torch.eye(cos_sim_matrix.size(0), dtype=torch.bool, device=features.device)
+    avg_cos_sim = cos_sim_matrix[mask].mean().item()
+
+    # Check collapse
+    is_collapsed = (feat_std < threshold_std) or (avg_cos_sim > threshold_cosine)
+
+    info = {
+        'feat_std': feat_std,
+        'feat_mean': feat_mean,
+        'avg_cos_sim': avg_cos_sim,
+        'is_collapsed': is_collapsed
+    }
+
+    return is_collapsed, info
+
+
+def log_training_info(epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss, uni_loss, learning_rate, tau, timing_info, mem, variance_config, collapse_info=None):
+    """
+    Log training information
+
+    Args:
+        epoch: current epoch
+        train_loss: training loss
+        val_loss: validation loss
+        learning_rate: current learning rate
+        tau: current tau value
+        timing_info: dict with keys 'train', 'validate', 'collapse_detection', 'evaluate' (or None), 'total'
+        collapse_info: collapse detection info (optional)
+    """
+    eval_time = f"{timing_info['evaluate']:.2f}s" if timing_info['evaluate'] is not None else "Not evaluated"
+    variance_weight=variance_config['weight']
+    covariance_weight=variance_config.get('covariance_weight', 0.0)
+    uniformity_weight=variance_config.get('uniformity_weight', 0.0)
 
     print(f"\n{'='*60}")
-    print(f"✅ 전체 정리 완료: {len(all_clean_maps)}개")
-    print(f"   Shape per sample: ({n_channels}, H, W) - H, W는 제품별 상이")
+    print(f"Epoch {epoch+1} Summary")
     print(f"{'='*60}")
-    
-    return all_clean_maps, all_clean_labels, all_info
+    print(f"Train Loss: {train_loss:.6f} / Val Loss: {val_loss:.6f} ")
+    print(f"  BYOL Loss: {byol_loss:.6f}, Var Loss: {var_loss:.6f}, Cov Loss: {cov_loss:.6f}, Uni Loss: {uni_loss:.6f}")
+    print(f"  BYOL Loss: {(byol_loss/train_loss)*100:.2f}%, Var Loss: {(var_loss*variance_weight/train_loss)*100:.2f}%, Cov Loss: {(cov_loss*covariance_weight/train_loss)*100:.2f}%, Uni Loss: {(uni_loss*uniformity_weight*-1/train_loss)*100:.2f}%")
+    print(f"Learning Rate: {learning_rate:.6e} / Tau (EMA): {tau:.6f}")
+    print(f"Time:")
+    print(f"  Train: {timing_info['train']:.2f}s / Valid: {timing_info['validate']:.2f}s / Collapse Detection: {timing_info['collapse_detection']:.2f}s / Evaluate: {eval_time} / Total: {timing_info['total']:.2f}s")
+    print(f"Memory -> Total: {mem.total / 1024**3:.1f} GB / Available: {mem.available / 1024**3:.1f} GB / Used: {mem.used / 1024**3:.1f} GB / Percent: {mem.percent}%")
+
+    if collapse_info is not None:
+        print(f"\nCollapse Detection:")
+        print(f"  Feature Std: {collapse_info['feat_std']:.6f} / Avg Cos Sim: {collapse_info['avg_cos_sim']:.6f} / Collapsed: {collapse_info['is_collapsed']}")
+
+    print(f"{'='*60}\n")
 
 
-class MultiSizeWaferDataset(Dataset):
-    """인덱스를 함께 반환하는 Dataset"""
+def test_training_functions():
+    """Test training functions"""
+    print("Testing training functions...")
 
-    def __init__(self, wafer_maps, labels, target_size=(128, 128), 
-                 use_filter=False, filter_on_the_fly=False, filter_params=None,
-                 use_density_aware=False, is_training=False, use_augmentation=False):
-        """
-        Args:
-            wafer_maps: 웨이퍼맵 리스트
-            labels: 라벨 리스트
-            target_size: 리사이즈 타겟 크기
-            use_filter: 필터링 사용 여부
-            filter_on_the_fly: True면 __getitem__ 시마다 필터링 (느림, 메모리 절약)
-                              False면 초기화 시 모두 필터링 (빠름, 메모리 사용)
-            filter_params: 필터 파라미터
-            use_density_aware: True면 밀도 기반 적응형 필터 사용 (권장!)
-        """
-        self.wafer_maps = []
-        self.labels = []
-        self.original_indices = []
-        self.target_size = target_size
-        self.use_filter = use_filter
-        self.filter_on_the_fly = filter_on_the_fly
-        self.use_density_aware = use_density_aware
-        self.is_training = is_training
-        self.use_augmentation = use_augmentation
+    # Create dummy model and data
+    from models.byol import BYOL
+    from utils.augmentation import get_byol_augmentation
 
-        # 필터 초기화
-        if use_filter:
-            if use_density_aware:
-                self.filter_obj = DensityAwareWaferMapFilter()
-            else:
-                if filter_params is None:
-                    filter_params = {
-                        'min_component_size': 5,
-                        'opening_kernel_size': 1,
-                        'closing_kernel_size': 5,
-                        'edge_preserve_strength': 0.9
-                    }
-                self.filter_obj = WaferMapFilter(**filter_params)
-        
-        print(f"🛡️  Dataset 생성 중...")
-        if use_filter and not filter_on_the_fly:
-            print(f"   사전 필터링 적용 중...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
-        for idx, (wm, label) in enumerate(zip(wafer_maps, labels)):
-            # 🔴 Shape 검증 수정: (C, H, W) 형식
-            if (isinstance(wm, np.ndarray) and
-                wm.dtype == np.float32 and
-                len(wm.shape) == 3 and      # (C, H, W)
-                wm.shape[0] > 0 and         # C > 0
-                wm.shape[1] > 0 and         # H > 0
-                wm.shape[2] > 0):           # W > 0
+    # Create model
+    model = BYOL(
+        encoder_dim=512,
+        projector_hidden=1024,
+        projector_out=256,
+        predictor_hidden=1024,
+        use_radial_encoding=True,
+        use_attention=True,
+        wafer_size=(128, 128),
+        tau=0.996
+    ).to(device)
 
-                # 사전 필터링 (filter_on_the_fly=False인 경우)
-                # Channel 0에만 적용
-                if use_filter and not filter_on_the_fly:
-                    if wm[0].sum() > 0:
-                        original_defects = wm[0].sum()
-                        
-                        if use_density_aware:
-                            wm[0], info = self.filter_obj.filter_single_map(wm[0])
-                        else:
-                            wm[0] = self.filter_obj.filter_single_map(wm[0])
-                        
-                        # 너무 많이 제거되면 스킵
-                        if wm[0].sum() < original_defects * 0.2:
-                            continue
-                
-                self.wafer_maps.append(wm)
-                self.labels.append(label)
-                self.original_indices.append(idx)
-
-        print(f"   최종 Dataset: {len(self.wafer_maps)}개")
-
-    def __len__(self):
-        return len(self.wafer_maps)
-
-    def __getitem__(self, idx):
-        wafer_map = self.wafer_maps[idx].copy()  # (C, H, W) - already multi-channel
-        label = self.labels[idx]
-        original_idx = self.original_indices[idx]
-
-        # On-the-fly 필터링 (filter_on_the_fly=True인 경우)
-        # Note: 이미 prepare_clean_data에서 필터링 했으므로 보통은 skip
-        if self.use_filter and self.filter_on_the_fly:
-            # Channel 0에만 필터링 적용
-            if wafer_map[0].sum() > 0:
-                if self.use_density_aware:
-                    wafer_map[0], _ = self.filter_obj.filter_single_map(wafer_map[0])
-                else:
-                    wafer_map[0] = self.filter_obj.filter_single_map(wafer_map[0])
-
-        # 안전한 전처리
-        # wafer_map: (C, H, W) numpy array → (C, target_H, target_W) tensor
-        tensor = torch.tensor(wafer_map, dtype=torch.float32)  # (C, H, W)
-        
-        # Resize
-        # F.interpolate expects (B, C, H, W), so add batch dim
-        tensor_4d = tensor.unsqueeze(0)  # (1, C, H, W)
-        resized = F.interpolate(tensor_4d, size=self.target_size, mode='bilinear', align_corners=False)
-        resized = resized.squeeze(0)  # (C, target_H, target_W)
-
-        # 🔴 Augmentation 적용 (training 시에만!)
-        if self.is_training and self.use_augmentation:
-            resized_aug = self._apply_augmentation(resized)
-        else:
-            resized_aug = None
-
-        return resized, resized_aug, label, original_idx
-    
-    def _apply_augmentation(self, tensor):
-        """
-        회전 불변성을 위한 Augmentation
-        D4 Dihedral group의 8가지 변환 중 하나를 균등하게 선택
-        
-        Args:
-            tensor: (C, H, W) - multi-channel
-        
-        Returns:
-            tensor: (C, H, W) - augmented
-        """
-        # 8가지 변환 중 하나를 균등하게 선택
-        transform_id = torch.randint(0, 8, (1,)).item()
-        
-        if transform_id == 0:
-            return tensor  # Identity (변환 없음)
-        elif transform_id == 1:
-            return torch.rot90(tensor, 1, dims=[1, 2])  # 90도 회전
-        elif transform_id == 2:
-            return torch.rot90(tensor, 2, dims=[1, 2])  # 180도 회전
-        elif transform_id == 3:
-            return torch.rot90(tensor, 3, dims=[1, 2])  # 270도 회전
-        elif transform_id == 4:
-            return torch.flip(tensor, dims=[2])  # 좌우 반전
-        elif transform_id == 5:
-            return torch.flip(tensor, dims=[1])  # 상하 반전
-        elif transform_id == 6:
-            # 90도 회전 + 좌우 반전 (대각선 대칭)
-            return torch.flip(torch.rot90(tensor, 1, dims=[1, 2]), dims=[2])
-        elif transform_id == 7:
-            # 90도 회전 + 상하 반전 (다른 대각선 대칭)
-            return torch.flip(torch.rot90(tensor, 1, dims=[1, 2]), dims=[1])
-
-
-def collate_fn(batch):
-    """인덱스를 포함한 collate 함수
-    + 문제 데이터를 자동으로 필터링하는 collate 함수
-    + 빈 맵(모두 0)도 제거
-    + Multi-channel 지원"""
-
-    safe_data = []
-    safe_data_aug = []
-    safe_labels = []
-    safe_indices = []
-    has_aug = True
-
-    for data, data_aug, label, original_idx in batch:
-        try:
-            # Shape 검증: (C, H, W)
-            if (isinstance(data, torch.Tensor) and
-                data.dtype == torch.float32 and
-                len(data.shape) == 3 and  # (C, H, W)
-                data.shape[0] > 0 and     # C > 0
-                data.shape[1] > 0 and     # H > 0
-                data.shape[2] > 0):       # W > 0
-
-                safe_data.append(data)
-                safe_data_aug.append(data_aug)
-                safe_labels.append(label)
-                safe_indices.append(original_idx)
-
-                # 첫 번째 샘플로 augmentation 여부 판단
-                if len(safe_data) == 1:
-                    has_aug = (data_aug is not None)
-
-        except:
-            continue
-
-    if len(safe_data) == 0:
-        # 모든 샘플이 문제인 경우 더미 배치 반환
-        # Multi-channel dummy
-        dummy = torch.zeros((1, 13, 128, 128), dtype=torch.float32)
-        return dummy, None, ["dummy"], [0]
-
-    batch_data = torch.stack(safe_data)
-    
-    if has_aug:
-        batch_data_aug = torch.stack(safe_data_aug)
-    else:
-        batch_data_aug = None
-
-    return batch_data, batch_data_aug, safe_labels, safe_indices
-
-
-
-def get_safe_num_workers(default=4):
-    """
-    가용 RAM에 따라 안전한 num_workers 결정
-    """
-    available_gb = psutil.virtual_memory().available / (1024**3)
-    if available_gb < 8:
-        num_workers = 0
-    elif available_gb < 12:
-        num_workers = 2
-    else:
-        num_workers = default
-    print(f"   num_workers: {num_workers} (가용 RAM: {available_gb:.1f}GB)")
-    return num_workers
-
-
-def recreate_dataloaders(train_dataset, valid_dataset, batch_size, num_workers, drop_last=True):
-    """
-    DataLoader worker 오류 발생 시 num_workers를 줄여서 재생성
-    """
-    pin_memory = (num_workers > 0)
-    print(f"   🔄 DataLoader 재생성 중... num_workers={num_workers}")
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=drop_last
-    )
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=drop_last
-    )
-    return train_loader, valid_loader
-
-
-
-def create_dataloaders(wafer_maps, labels, batch_size=64, target_size=(128, 128), test_size=0.2, 
-                        use_filter=True, filter_on_the_fly=False, filter_params=None, 
-                        use_density_aware=False, use_augmentation=False, drop_last=True):
-    
-    print("\n🔧 안전한 DataLoader 생성")
-    print("="*40)
-
-    if use_filter:
-        if use_density_aware:
-            mode = "Density-Aware (밀도 기반 적응형)"
-        elif filter_on_the_fly:
-            mode = "On-the-fly"
-    else:
-        mode = "Pre-filtering"
-    print(f"   필터링 모드: {mode}")
-
-    # 🔹 train/valid 분할을 먼저 수행
-    train_indices, valid_indices = train_test_split(
-        range(len(wafer_maps)), test_size=test_size, random_state=42
-    )
-    
-    # 🔹 분할된 데이터로 train/valid 데이터 생성
-    train_maps = [wafer_maps[i] for i in train_indices]
-    train_labels = [labels[i] for i in train_indices]
-    
-    valid_maps = [wafer_maps[i] for i in valid_indices]
-    valid_labels = [labels[i] for i in valid_indices]
-
-    # 🔹 별도의 dataset 객체 생성
-    train_dataset = MultiSizeWaferDataset(
-        train_maps, train_labels, 
-        target_size=target_size,
-        use_filter=use_filter,
-        filter_on_the_fly=filter_on_the_fly,
-        filter_params=filter_params,
-        use_density_aware=use_density_aware,
-        is_training=True,  # 🔹 train은 True
-        use_augmentation=use_augmentation
-    )
-    
-    valid_dataset = MultiSizeWaferDataset(
-        valid_maps, valid_labels, 
-        target_size=target_size,
-        use_filter=use_filter,
-        filter_on_the_fly=filter_on_the_fly,
-        filter_params=filter_params,
-        use_density_aware=use_density_aware,
-        is_training=False,  # 🔹 valid은 False
-        use_augmentation=False  # 🔹 항상 False
+    # Create dummy dataloader
+    dummy_data = torch.randn(32, 1, 128, 128)
+    dataloader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(dummy_data),
+        batch_size=4,
+        shuffle=True
     )
 
-    print(f"   Train: {len(train_dataset)}개 (Augmentation: {use_augmentation})")
-    print(f"   Valid: {len(valid_dataset)}개 (Augmentation: False Fixed)")
+    # Create optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    _num_workers = get_safe_num_workers(default=4)
-    _pin_memory = (_num_workers > 0)
+    # Create augmentation
+    augmentation = get_byol_augmentation('strong')
 
-    # DataLoader 생성
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=_num_workers,
-        pin_memory=_pin_memory,
-        drop_last=drop_last
+    # Test training for one epoch
+    print("\nTesting training epoch...")
+    avg_loss = train_byol_epoch(
+        model, dataloader, optimizer, device,
+        tau=0.996, augmentation=augmentation, epoch=0
     )
+    print(f"Average training loss: {avg_loss:.4f}")
 
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=_num_workers,
-        pin_memory=_pin_memory,
-        drop_last=drop_last
-    )
+    # Test validation
+    print("\nTesting validation...")
+    val_loss = validate_byol_epoch(model, dataloader, device, augmentation)
+    print(f"Validation loss: {val_loss:.4f}")
 
-    print(f"   Train 배치: {len(train_loader)}개 / Valid 배치: {len(valid_loader)}개")
+    # Test feature extraction
+    print("\nTesting feature extraction...")
+    features, _ = extract_features(model, dataloader, device, use_target=True)
+    print(f"Extracted features shape: {features.shape}")
 
-    return train_loader, valid_loader
+    # Test collapse detection
+    print("\nTesting collapse detection...")
+    is_collapsed, info = detect_collapse(features)
+    print(f"Collapsed: {is_collapsed}")
+    print(f"Info: {info}")
+
+    print("\nTraining functions test passed!")
+
+
+if __name__ == "__main__":
+    # Note: This will only work if models and utils are properly set up
+    try:
+        test_training_functions()
+    except ImportError as e:
+        print(f"Import error: {e}")
+        print("Run from project root with proper PYTHONPATH")

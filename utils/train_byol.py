@@ -309,7 +309,6 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
     has_reg = (variance_weight > 0 or covariance_weight > 0)
     avg_feat_std = total_feat_std / total_batches if has_reg else 0.0
     avg_cos_sim = total_cos_sim / total_batches if has_reg else 0.0
-    total_uni_loss += uni_loss.item()  # 루프 안에 추가
     
     return avg_total_loss, avg_byol_loss, avg_var_loss, avg_cov_loss, avg_uni_loss, avg_feat_std, avg_cos_sim
 
@@ -418,9 +417,11 @@ def extract_features(model, dataloader, device, use_target=True, verbose=True, k
                 labels = None
 
             # sample_images 수집 (keep_images_n개 채울 때까지)
-            if sample_images is not None and len(sample_images) < keep_images_n:
-                remaining = keep_images_n - len(sample_images)
-                sample_images.append(images[:remaining].cpu())
+            if sample_images is not None:
+                already_collected = sum(t.size(0) for t in sample_images)
+                if already_collected < keep_images_n:
+                    remaining = keep_images_n - already_collected
+                    sample_images.append(images[:remaining].cpu())
 
             images = images.to(device)
 
@@ -657,11 +658,11 @@ def log_training_info(epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss
     print(f"{'='*60}")
     print(f"Train Loss: {train_loss:.6f} / Val Loss: {val_loss:.6f} ")
     print(f"  BYOL Loss: {byol_loss:.6f}, Var Loss: {var_loss:.6f}, Cov Loss: {cov_loss:.6f}, Uni Loss: {uni_loss:.6f}")
-    print(f"  BYOL Loss: {(byol_loss/train_loss)*100:.2f}%, Var Loss: {(var_loss*variance_weight)*100:.2f}%, Cov Loss: {(cov_loss*covariance_weight)*100:.2f}%, Uni Loss: {(uni_loss*uniformity_weight*-1)*100:.2f}%")
+    print(f"  BYOL Loss: {(byol_loss/train_loss)*100:.2f}%, Var Loss: {(var_loss*variance_weight/train_loss)*100:.2f}%, Cov Loss: {(cov_loss*covariance_weight/train_loss)*100:.2f}%, Uni Loss: {(uni_loss*uniformity_weight*-1/train_loss)*100:.2f}%")
     print(f"Learning Rate: {learning_rate:.6e} / Tau (EMA): {tau:.6f}")
     print(f"Time:")
     print(f"  Train: {timing_info['train']:.2f}s / Valid: {timing_info['validate']:.2f}s / Collapse Detection: {timing_info['collapse_detection']:.2f}s / Evaluate: {eval_time} / Total: {timing_info['total']:.2f}s")
-    print(f"  Memory -> Total: {mem.total / 1024**3:.1f} GB / Available: {mem.available / 1024**3:.1f} GB / Used: {mem.used / 1024**3:.1f} GB / Percent: {mem.percent}%")
+    print(f"Memory -> Total: {mem.total / 1024**3:.1f} GB / Available: {mem.available / 1024**3:.1f} GB / Used: {mem.used / 1024**3:.1f} GB / Percent: {mem.percent}%")
 
     if collapse_info is not None:
         print(f"\nCollapse Detection:")
@@ -740,3 +741,4 @@ if __name__ == "__main__":
         test_training_functions()
     except ImportError as e:
         print(f"Import error: {e}")
+        print("Run from project root with proper PYTHONPATH")
