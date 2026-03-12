@@ -65,6 +65,14 @@ class TrainingSummary:
 
         # Rotation invariance (있으면)
         rotation_inv = self.history.get('rotation_invariance', [])
+
+        # 🆕 새 지표
+        knn_consistency = self.history.get('knn_consistency', [])
+        calinski_harabasz = self.history.get('calinski_harabasz', [])
+        davies_bouldin = self.history.get('davies_bouldin', [])
+        cluster_consistency_d4 = self.history.get('cluster_consistency_d4', [])
+        avg_distance_top_k = self.history.get('avg_distance_top_k', [])
+        composite_score = self.history.get('composite_score', [])
         
         # 🔹 Helper function: 가장 가까운 evaluation epoch의 value 찾기
         def find_closest_value(metric_list, target_epoch):
@@ -123,6 +131,24 @@ class TrainingSummary:
             rot_value = rotation_inv[idx] if idx < len(rotation_inv) else None
             row['Rotation Inv'] = f"{rot_value:.4f}" if rot_value is not None else "N/A"
 
+            knn_value = knn_consistency[idx] if idx < len(knn_consistency) else None
+            row['kNN Consist'] = f"{knn_value:.4f}" if knn_value is not None else "N/A"
+
+            ch_value = calinski_harabasz[idx] if idx < len(calinski_harabasz) else None
+            row['CH Score'] = f"{ch_value:.1f}" if ch_value is not None else "N/A"
+
+            db_value = davies_bouldin[idx] if idx < len(davies_bouldin) else None
+            row['DB Score'] = f"{db_value:.4f}" if db_value is not None else "N/A"
+
+            d4_value = cluster_consistency_d4[idx] if idx < len(cluster_consistency_d4) else None
+            row['D4 Consist'] = f"{d4_value:.4f}" if d4_value is not None else "N/A"
+
+            dist_value = avg_distance_top_k[idx] if idx < len(avg_distance_top_k) else None
+            row['Avg Dist@k'] = f"{dist_value:.4f}" if dist_value is not None else "N/A"
+
+            comp_value = composite_score[idx] if idx < len(composite_score) else None
+            row['Composite'] = f"{comp_value:.4f}" if comp_value is not None else "N/A"
+
             summary_data.append(row)
 
         # 마지막 epoch도 추가 (완료 상태)
@@ -150,6 +176,24 @@ class TrainingSummary:
 
             rot_value = rotation_inv[last_eval_idx] if last_eval_idx >= 0 and last_eval_idx < len(rotation_inv) else None
             row['Rotation Inv'] = f"{rot_value:.4f}" if rot_value is not None else "N/A"
+
+            knn_value = knn_consistency[last_eval_idx] if last_eval_idx >= 0 and last_eval_idx < len(knn_consistency) else None
+            row['kNN Consist'] = f"{knn_value:.4f}" if knn_value is not None else "N/A"
+
+            ch_value = calinski_harabasz[last_eval_idx] if last_eval_idx >= 0 and last_eval_idx < len(calinski_harabasz) else None
+            row['CH Score'] = f"{ch_value:.1f}" if ch_value is not None else "N/A"
+
+            db_value = davies_bouldin[last_eval_idx] if last_eval_idx >= 0 and last_eval_idx < len(davies_bouldin) else None
+            row['DB Score'] = f"{db_value:.4f}" if db_value is not None else "N/A"
+
+            d4_value = cluster_consistency_d4[last_eval_idx] if last_eval_idx >= 0 and last_eval_idx < len(cluster_consistency_d4) else None
+            row['D4 Consist'] = f"{d4_value:.4f}" if d4_value is not None else "N/A"
+
+            dist_value = avg_distance_top_k[last_eval_idx] if last_eval_idx >= 0 and last_eval_idx < len(avg_distance_top_k) else None
+            row['Avg Dist@k'] = f"{dist_value:.4f}" if dist_value is not None else "N/A"
+
+            comp_value = composite_score[last_eval_idx] if last_eval_idx >= 0 and last_eval_idx < len(composite_score) else None
+            row['Composite'] = f"{comp_value:.4f}" if comp_value is not None else "N/A"
 
             summary_data.append(row)
         
@@ -213,7 +257,32 @@ class TrainingSummary:
         # 🔹 Silhouette: 가장 가까운 평가 결과
         sil_value = find_closest_value(silhouette, best_epoch)
         best_info['Silhouette'] = f"{sil_value:.4f}" if sil_value is not None else "N/A"
-        
+
+        # 🆕 추가 지표
+        knn_consistency = self.history.get('knn_consistency', [])
+        knn_value = find_closest_value(knn_consistency, best_epoch)
+        best_info['kNN Consist'] = f"{knn_value:.4f}" if knn_value is not None else "N/A"
+
+        calinski = self.history.get('calinski_harabasz', [])
+        ch_value = find_closest_value(calinski, best_epoch)
+        best_info['CH Score'] = f"{ch_value:.1f}" if ch_value is not None else "N/A"
+
+        davies = self.history.get('davies_bouldin', [])
+        db_value = find_closest_value(davies, best_epoch)
+        best_info['DB Score'] = f"{db_value:.4f}" if db_value is not None else "N/A"
+
+        d4_consist = self.history.get('cluster_consistency_d4', [])
+        d4_value = find_closest_value(d4_consist, best_epoch)
+        best_info['D4 Consist'] = f"{d4_value:.4f}" if d4_value is not None else "N/A"
+
+        avg_dist = self.history.get('avg_distance_top_k', [])
+        dist_value = find_closest_value(avg_dist, best_epoch)
+        best_info['Avg Dist@k'] = f"{dist_value:.4f}" if dist_value is not None else "N/A"
+
+        composite = self.history.get('composite_score', [])
+        comp_value = find_closest_value(composite, best_epoch)
+        best_info['Composite'] = f"{comp_value:.4f}" if comp_value is not None else "N/A"
+
         return best_info
     
     def print_summary(self, interval=10, save_csv=True):
@@ -296,6 +365,37 @@ class TrainingSummary:
                     print(" ⭐ (양호)")
                 else:
                     print(" ⚠️  (개선 필요)")
+
+            # 🆕 추가 지표 출력
+            knn_consistency = self.history.get('knn_consistency', [])
+            knn_value = find_closest_value(knn_consistency, final_epoch)
+            if knn_value is not None:
+                print(f"kNN Consistency       : {knn_value:.4f}")
+
+            calinski = self.history.get('calinski_harabasz', [])
+            ch_value = find_closest_value(calinski, final_epoch)
+            if ch_value is not None:
+                print(f"Calinski-Harabasz     : {ch_value:.1f}")
+
+            davies = self.history.get('davies_bouldin', [])
+            db_value = find_closest_value(davies, final_epoch)
+            if db_value is not None:
+                print(f"Davies-Bouldin        : {db_value:.4f}")
+
+            d4_consist = self.history.get('cluster_consistency_d4', [])
+            d4_value = find_closest_value(d4_consist, final_epoch)
+            if d4_value is not None:
+                print(f"D4 Consistency        : {d4_value:.4f}")
+
+            avg_dist = self.history.get('avg_distance_top_k', [])
+            dist_value = find_closest_value(avg_dist, final_epoch)
+            if dist_value is not None:
+                print(f"Avg Distance@k        : {dist_value:.4f}")
+
+            composite = self.history.get('composite_score', [])
+            comp_value = find_closest_value(composite, final_epoch)
+            if comp_value is not None:
+                print(f"Composite Score       : {comp_value:.4f}")
         
         print("\n" + "="*120)
         

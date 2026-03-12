@@ -68,6 +68,13 @@ class BYOLMonitor:
                 'noise_ratio': [],
                 'rotation_invariance': [],
                 'knn_consistency': [],
+                'calinski_harabasz': [],
+                'davies_bouldin': [],
+                'cluster_consistency_d4': [],
+                'avg_distance_top_k': [],
+                'knn_consistency_std': [],
+                'perfect_consistency_ratio': [],
+                'composite_score': [],
             }
     
     def log_epoch(self, epoch, train_loss, val_loss, lr, tau):
@@ -121,7 +128,18 @@ class BYOLMonitor:
         self.history['noise_ratio'].append(clustering.get('noise_ratio'))
         self.history['rotation_invariance'].append(rotation.get('avg_cosine_similarity'))
         self.history['knn_consistency'].append(knn.get('knn_consistency'))
+        self.history['calinski_harabasz'].append(clustering.get('calinski_harabasz'))
+        self.history['davies_bouldin'].append(clustering.get('davies_bouldin'))
+        self.history['cluster_consistency_d4'].append(metrics.get('cluster_consistency_d4'))
+        retrieval = metrics.get('retrieval', {})
+        self.history['avg_distance_top_k'].append(retrieval.get('avg_distance_top_k'))
+        self.history['knn_consistency_std'].append(knn.get('knn_consistency_std'))
+        self.history['perfect_consistency_ratio'].append(knn.get('perfect_consistency_ratio'))
     
+    def log_composite_score(self, score):
+        """Log composite score for the current evaluation epoch"""
+        self.history['composite_score'].append(score)
+
     def should_evaluate(self, epoch):
         """Check if should perform evaluation"""
         return (epoch + 1) % self.eval_frequency == 0
@@ -393,7 +411,15 @@ class BYOLMonitor:
             for key in ['uniformity_loss', 'uniformity_weight']:
                 if key not in self.history:
                     self.history[key] = [0.0] * n_epochs
-                    
+
+            # ✅ 새 evaluation 키 backward-compat
+            n_evals = len(self.history.get('silhouette', []))
+            for key in ['calinski_harabasz', 'davies_bouldin', 'cluster_consistency_d4',
+                        'avg_distance_top_k', 'knn_consistency_std',
+                        'perfect_consistency_ratio', 'composite_score']:
+                if key not in self.history:
+                    self.history[key] = [None] * n_evals
+
             return True
         return False
     

@@ -474,6 +474,8 @@ def train_byol_wafer(config):
                     eval_metrics, epoch_end_cos_sim, composite_weights
                 )
 
+                monitor.log_composite_score(current_composite)
+
                 if current_composite is not None:
                     print(f"  📊 Composite Score: {current_composite:.4f} (best: {best_composite:.4f})")
 

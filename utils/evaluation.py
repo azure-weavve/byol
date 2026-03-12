@@ -106,8 +106,8 @@ def evaluate_knn_consistency(model, sample_images, device, all_features=None,
 
     with torch.no_grad():
         for idx in range(actual_n_samples):
-            img = sample_images[idx]          # (C, H, W) CPU tensor
             global_idx = selected_indices[idx]  # all_features_np에서의 인덱스
+            img = sample_images[global_idx]          # (C, H, W) CPU tensor
 
             # C4 회전 적용 (90°, 180°, 270°)
             rotated_images = []
@@ -790,6 +790,16 @@ def print_evaluation_results(metrics):
         print(f"  {key:30s}: {value:.4f}")
 
     print(f"\n  {'Cluster Consistency (D4)':30s}: {metrics['cluster_consistency_d4']:.4f}")
+
+    # kNN Consistency
+    print("\nkNN Consistency Metrics:")
+    print("-" * 60)
+    for key, value in metrics['knn_consistency'].items():
+        if value is not None:
+            if isinstance(value, float):
+                print(f"  {key:30s}: {value:.4f}")
+            else:
+                print(f"  {key:30s}: {value}")
 
     print("\n" + "="*60)
 
