@@ -215,8 +215,8 @@ def get_batch_byol_augmentation(augmentation_type='strong', n_spatial_channels=1
             use_d4=True,
             use_c4_only=True,
             use_defect_dropout=True,
-            defect_dropout_prob=0.7,
-            defect_dropout_rate=(0.2, 0.7),
+            defect_dropout_prob=0.5,
+            defect_dropout_rate=(0.1, 0.3),
             n_spatial_channels=n_spatial_channels,
         )
 

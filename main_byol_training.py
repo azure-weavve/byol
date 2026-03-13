@@ -31,8 +31,18 @@ from utils.train_byol import (
 )
 from utils.evaluation import evaluate_all, print_evaluation_results
 from utils.byol_monitor import BYOLMonitor, visualize_latent_space
-from utils.dataloader_utils import prepare_clean_data, create_dataloaders, recreate_dataloaders
+from utils.dataloader_utils import prepare_clean_data, create_dataloaders, recreate_dataloaders, collate_fn
 from utils.gpu_monitor import print_gpu_memory, reset_peak_stats, get_peak_memory_mb
+
+# S3 접속
+import boto3
+
+client = boto3.client(
+    service_name='s3',
+    aws_access_key_id="AKIA1B073F6BABAA9CB2", # AccessKey
+    aws_secret_access_key="EK+4wZE2ie/OEWRD8aX8ONlN3iWRl2jB3np7HCks", # AccessSecretKey
+    endpoint_url='http://s3.dataplatform.samsungds.net:9020'
+) 
 
 
 
@@ -145,10 +155,32 @@ def compute_composite_score(eval_metrics, avg_cos_sim, weights):
              + silhouette * weights.get('silhouette', 0.3)
              + avg_cos_sim * weights.get('avg_cos_sim', -0.2))
 
-    return score
+    return score, knn_consistency, silhouette
+
+def get_uniformity_weight(epoch, config):
+    """
+    Warmup 후 uniformity weight를 점진적으로 증가
+    
+    epoch 0~9:   0.0     (byol이 기본 패턴 먼저 학습)
+    epoch 10~19: 0.001   (약하게 시작)
+    epoch 20~:   0.005   (목표 weight)
+    """
+    warmup_end    = config.get('uniformity_warmup_end', 10)
+    rampup_end    = config.get('uniformity_rampup_end', 20)
+    target_weight = config.get('uniformity_weight', 0.005)
+    
+    if epoch < warmup_end:
+        return 0.0
+    elif epoch < rampup_end:
+        # 선형 증가
+        progress = (epoch - warmup_end) / (rampup_end - warmup_end)
+        return target_weight * progress
+    else:
+        return target_weight
+    
 
 
-def train_byol_wafer(config):
+def train_byol_wafer(config, file_number):
     """
     Main training function
 
@@ -319,7 +351,7 @@ def train_byol_wafer(config):
                 'margin': config.get('variance_margin', 0.1),
                 'weight': config.get('variance_weight', 0.0),
                 'covariance_weight': config.get('covariance_weight', 0.0),
-                'uniformity_weight': config.get('uniformity_weight', 0.0),
+                'uniformity_weight': get_uniformity_weight(epoch, config),  # ← 변경
             }
 
             # Get current tau for EMA update
@@ -445,8 +477,18 @@ def train_byol_wafer(config):
                         _, collapse_info = detect_collapse(sample_features)
                         avg_cos_sim = collapse_info['avg_cos_sim']
 
+                # evaluation 직전에만 임시 생성
+                eval_loader = torch.utils.data.DataLoader(
+                    val_loader.dataset,
+                    batch_size=val_loader.batch_size,
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=False,
+                    collate_fn=collate_fn,
+                )
+
                 eval_metrics, cluster_labels = evaluate_all(
-                    model, val_loader, device, n_samples_invariance=100,
+                    model, eval_loader, device, n_samples_invariance=100,
                     k_knn=config['k_knn'], log_dir=config['log_dir']
                 )
                 print_evaluation_results(eval_metrics)
@@ -470,14 +512,12 @@ def train_byol_wafer(config):
 
                 # 개선: collapse_info의 에폭 끝 cos_sim 사용
                 epoch_end_cos_sim = collapse_info['avg_cos_sim']
-                current_composite = compute_composite_score(
+                current_composite, knn_consistency, silhouette = compute_composite_score(
                     eval_metrics, epoch_end_cos_sim, composite_weights
                 )
 
-                monitor.log_composite_score(current_composite)
-
                 if current_composite is not None:
-                    print(f"  📊 Composite Score: {current_composite:.4f} (best: {best_composite:.4f})")
+                    print(f"  📊 Composite Score: {current_composite:.4f} (knn: {knn_consistency}, sil: {silhouette}, cos: {avg_cos_sim}) (best: {best_composite:.4f})")
 
                     if current_composite > best_composite:
                         best_composite = current_composite
@@ -512,6 +552,7 @@ def train_byol_wafer(config):
                 print(f"\n⚠️ Evaluation failed at epoch {epoch+1}: {e}")
                 print(f"  temp_checkpoint 보존 (pending_evaluation=True)")
                 print(f"  resume_path를 temp_checkpoint.pth로 설정하면 evaluation 재시도")
+                break
 
             eval_time = time.time() - t0
             pending_evaluation = False  # ✅ 이번 루프에서는 해소
@@ -597,11 +638,14 @@ def train_byol_wafer(config):
     
     from utils.training_summary import generate_training_summary
     generate_training_summary(log_dir=config['log_dir'], interval=config['save_frequency'])
+
+    client.upload_file(Filename=f"./logs_{file_number}/history.json", Bucket="DX", Key=f"EDS_MAP/training_logs/history.json")
+    client.upload_file(Filename=f"./logs_{file_number}/training_summary.csv", Bucket="DX", Key=f"EDS_MAP/training_logs/training_summary.csv")
     
     print("\nTraining completed!")
 
 
-def get_default_config(path):
+def get_default_config(path, file_number):
     """Get default configuration"""
     config = {
         # Data - Multiple wafer data sources
@@ -643,7 +687,7 @@ def get_default_config(path):
         'augmentation_type': 'strong',
 
         # Scheduler
-        'T_0': 30,
+        'T_0': 100,
         'T_mult': 1,
         # 'eta_max': 0.001,
         'eta_max': 0.0005,
@@ -655,8 +699,10 @@ def get_default_config(path):
         'variance_target_std': 1.0,            # 목표 std
         'variance_margin': 0.1,                # robust margin (0.9~1.1 허용)
         'variance_weight': 0.05,                # loss weight (0.2 -> 0.05)
-        'covariance_weight': 0.05,              # 🆕 (0.04 -> 0.1 -> 0.05)
+        'covariance_weight': 0.01,              # 🆕 (0.04 -> 0.1 -> 0.05)
         'uniformity_weight': 0.005,
+        'uniformity_warmup_end': 10,   # 0~9 에폭: uniformity 꺼둠
+        'uniformity_rampup_end': 20,   # 10~19 에폭: 0→0.005 선형 증가
 
         # Composite score weights (early stopping & best model 기준)
         'composite_weights': {
@@ -681,8 +727,8 @@ def get_default_config(path):
         'n_spatial_channels' : 13,             # BIN Category Channel 수
 
         # Paths
-        'save_dir': 'checkpoints',
-        'log_dir': 'logs',
+        'save_dir': 'checkpoints_'+file_number,
+        'log_dir': 'logs_'+file_number,
         'resume_path': None
         # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/best_model.pth"
         # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/checkpoint_epoch_30.pth"
@@ -698,12 +744,13 @@ def main():
     base_path = path + "/clustering/pth_file"
     today = datetime.today()
     result = today.strftime("%y%m%d")
+    file_number = int(os.path.splitext(os.path.basename(__file__))[0].split('_')[-1]),
 
     # Get default config
-    config = get_default_config(path=path)
+    config = get_default_config(path=path, file_number=file_number)
 
     # Start training
-    train_byol_wafer(config)
+    train_byol_wafer(config, file_number)
 
 
 if __name__ == "__main__":
