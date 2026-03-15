@@ -401,12 +401,6 @@ class BYOLMonitor:
                 n_evals = len(self.history.get('silhouette', []))
                 self.history['knn_consistency'] = [None] * n_evals
 
-            # ✅ 아래에 추가
-            n_epochs = len(self.history.get('epoch', []))
-            for key in ['uniformity_loss', 'uniformity_weight']:
-                if key not in self.history:
-                    self.history[key] = [0.0] * n_epochs
-
             # ✅ 새 evaluation 키 backward-compat
             n_evals = len(self.history.get('silhouette', []))
             for key in ['calinski_harabasz', 'davies_bouldin', 'cluster_consistency_d4',

@@ -308,7 +308,7 @@ def train_byol_wafer(config, file_number):
             tau = get_tau_schedule(epoch, config['epochs'], config['tau_base'], config['tau_max'])
 
             # Worker 오류 시 num_workers를 줄여서 최대 3회 재시도
-            max_retries = 3
+            max_retries = 4
 
             for retry in range(max_retries):
                 try:
@@ -647,8 +647,6 @@ def get_default_config(path, file_number):
         'variance_margin': 0.1,                # robust margin (0.9~1.1 허용)
         'variance_weight': 0.05,                # loss weight (0.2 -> 0.05)
         'covariance_weight': 0.01,              # 🆕 (0.04 -> 0.1 -> 0.05)
-        'uniformity_warmup_end': 10,   # 0~9 에폭: uniformity 꺼둠
-        'uniformity_rampup_end': 20,   # 10~19 에폭: 0→0.005 선형 증가
 
         'collapse_guard': {
             'feature_std_min': 0.5,
@@ -688,7 +686,7 @@ def main():
     base_path = path + "/clustering/pth_file"
     today = datetime.today()
     result = today.strftime("%y%m%d")
-    file_number = int(os.path.splitext(os.path.basename(__file__))[0].split('_')[-1]),
+    file_number = int(os.path.splitext(os.path.basename(__file__))[0].split('_')[-1])
 
     # Get default config
     config = get_default_config(path=path, file_number=file_number)
