@@ -129,54 +129,6 @@ def load_wafer_data(data_configs, use_filter=True, use_density_aware=False, use_
     )
 
     return wafer_maps, labels, info
-
-# 🆕 Composite score 계산 함수
-def compute_composite_score(eval_metrics, avg_cos_sim, weights):
-    """
-    Composite score = silhouette * w1 + rotation_inv * w2 + avg_cos_sim * w3
-    (w3는 음수이므로 cos_sim이 높으면 페널티)
-
-    변경된 Composite score:
-    knn_consistency * 0.5 + silhouette * 0.3 + avg_cos_sim * (-0.2)
-
-    기존 rotation_invariance 제거, knn_consistency 추가
-    """
-    clustering = eval_metrics.get('clustering', {})
-    knn = eval_metrics.get('knn_consistency', {})
-
-    silhouette = clustering.get('silhouette')
-    knn_consistency = knn.get('knn_consistency')
-
-    # 하나라도 없으면 계산 불가
-    if silhouette is None or knn_consistency is None:
-        return None
-
-    score = (knn_consistency * weights.get('knn_consistency', 0.5)
-             + silhouette * weights.get('silhouette', 0.3)
-             + avg_cos_sim * weights.get('avg_cos_sim', -0.2))
-
-    return score, knn_consistency, silhouette
-
-def get_uniformity_weight(epoch, config):
-    """
-    Warmup 후 uniformity weight를 점진적으로 증가
-    
-    epoch 0~9:   0.0     (byol이 기본 패턴 먼저 학습)
-    epoch 10~19: 0.001   (약하게 시작)
-    epoch 20~:   0.005   (목표 weight)
-    """
-    warmup_end    = config.get('uniformity_warmup_end', 10)
-    rampup_end    = config.get('uniformity_rampup_end', 20)
-    target_weight = config.get('uniformity_weight', 0.005)
-    
-    if epoch < warmup_end:
-        return 0.0
-    elif epoch < rampup_end:
-        # 선형 증가
-        progress = (epoch - warmup_end) / (rampup_end - warmup_end)
-        return target_weight * progress
-    else:
-        return target_weight
     
 
 
@@ -300,12 +252,11 @@ def train_byol_wafer(config, file_number):
     # Resume from checkpoint if specified
     start_epoch = 0
     best_val_loss = float('inf')
-    best_composite = -float('inf')
     pending_evaluation = False
 
     if config.get('resume_path') is not None and os.path.exists(config['resume_path']):
         print(f"\nResuming from checkpoint: {config['resume_path']}")
-        start_epoch, resumed_loss, best_val_loss, best_composite, pending_evaluation = load_checkpoint(
+        start_epoch, resumed_loss, best_val_loss, pending_evaluation = load_checkpoint(
             model, optimizer, scheduler, config['resume_path'], device
         )
 
@@ -351,7 +302,6 @@ def train_byol_wafer(config, file_number):
                 'margin': config.get('variance_margin', 0.1),
                 'weight': config.get('variance_weight', 0.0),
                 'covariance_weight': config.get('covariance_weight', 0.0),
-                'uniformity_weight': get_uniformity_weight(epoch, config),  # ← 변경
             }
 
             # Get current tau for EMA update
@@ -363,7 +313,7 @@ def train_byol_wafer(config, file_number):
             for retry in range(max_retries):
                 try:
                     t0 = time.time()
-                    train_loss, byol_loss, var_loss, cov_loss, uni_loss, feat_std, avg_cos_sim = train_byol_epoch(
+                    train_loss, byol_loss, var_loss, cov_loss, feat_std, avg_cos_sim = train_byol_epoch(
                         model, train_loader, optimizer, device,
                         tau=tau, augmentation=aug_weak, augmentation_strong=aug_strong, epoch=epoch, variance_config=variance_config, verbose=False
                     )
@@ -427,8 +377,6 @@ def train_byol_wafer(config, file_number):
                 feature_std=feat_std,
                 avg_cos_sim=avg_cos_sim,
                 target_std=variance_config.get('target_std', 1.0),
-                uniformity_loss=uni_loss,                                    # 🆕
-                uniformity_weight=variance_config.get('uniformity_weight', 0.0)  # 🆕
             )
             monitor.log_collapse_detection(
                 epoch, collapse_info['feat_std'],
@@ -440,7 +388,6 @@ def train_byol_wafer(config, file_number):
             save_checkpoint(
                 model, optimizer, scheduler, epoch, val_loss, temp_ckpt_path,
                 best_val_loss=best_val_loss,
-                best_composite=best_composite,
                 config=config,
                 pending_evaluation=False
             )
@@ -457,7 +404,6 @@ def train_byol_wafer(config, file_number):
             save_checkpoint(
                 model, optimizer, scheduler, epoch, val_loss, temp_ckpt_path,
                 best_val_loss=best_val_loss,
-                best_composite=best_composite,
                 config=config,
                 pending_evaluation=True  # ✅ 평가 미완료 표시
             )
@@ -506,44 +452,49 @@ def train_byol_wafer(config, file_number):
                 #     title=f'Latent Space (Epoch {epoch+1})'
                 # )
 
-                composite_weights = config.get('composite_weights', {
-                    'knn_consistency': 0.5, 'silhouette': 0.3, 'avg_cos_sim': -0.2
-                })
 
-                # 개선: collapse_info의 에폭 끝 cos_sim 사용
-                epoch_end_cos_sim = collapse_info['avg_cos_sim']
-                current_composite, knn_consistency, silhouette = compute_composite_score(
-                    eval_metrics, epoch_end_cos_sim, composite_weights
+                # --- Collapse Guard 확인 ---
+                collapse_guard = config.get('collapse_guard', {
+                    'feature_std_min': 0.5,
+                    'avg_cos_sim_max': 0.90,
+                })
+                epoch_feat_std = collapse_info['feat_std']
+                epoch_avg_cos_sim = collapse_info['avg_cos_sim']
+
+                passes_guard = (
+                    epoch_feat_std > collapse_guard['feature_std_min']
+                    and epoch_avg_cos_sim < collapse_guard['avg_cos_sim_max']
                 )
 
-                if current_composite is not None:
-                    print(f"  📊 Composite Score: {current_composite:.4f} (knn: {knn_consistency}, sil: {silhouette}, cos: {avg_cos_sim}) (best: {best_composite:.4f})")
+                guard_status = "✅ PASS" if passes_guard else "❌ FAIL"
+                print(f"  🛡️ Collapse Guard: {guard_status} "
+                    f"(feat_std={epoch_feat_std:.4f} > {collapse_guard['feature_std_min']}, "
+                    f"avg_cos_sim={epoch_avg_cos_sim:.4f} < {collapse_guard['avg_cos_sim_max']})")
 
-                    if current_composite > best_composite:
-                        best_composite = current_composite
-                        save_path = os.path.join(config['save_dir'], 'best_model.pth')
-                        save_checkpoint(
-                            model, optimizer, scheduler, epoch, val_loss, save_path,
-                            best_val_loss=best_val_loss,
-                            best_composite=best_composite,
-                            config=config
-                        )
-                        knn = eval_metrics.get('knn_consistency', {}).get('knn_consistency')
-                        sil = eval_metrics.get('clustering', {}).get('silhouette', 0)
-                        rot = eval_metrics.get('rotation_invariance', {}).get('avg_cosine_similarity', 0)
-                        print(f"  🏆 Best model saved! composite={current_composite:.4f} "
-                            f"(knn={knn:.3f}, sil={sil:.3f}, rot={rot:.3f}, cos={avg_cos_sim:.3f})")
+                # --- Best Model 선정: val_loss 최소 + collapse guard 통과 ---
+                if passes_guard and val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_path = os.path.join(config['save_dir'], 'best_model.pth')
+                    save_checkpoint(
+                        model, optimizer, scheduler, epoch, val_loss, save_path,
+                        best_val_loss=best_val_loss,
+                        config=config
+                    )
+                    print(f"  🏆 Best model saved! val_loss={val_loss:.6f} "
+                        f"(feat_std={epoch_feat_std:.4f}, avg_cos_sim={epoch_avg_cos_sim:.4f})")
+                elif not passes_guard:
+                    print(f"  ⚠️ Collapse guard failed — skipping best model update")
 
-                    if early_stopping(current_composite):
-                        print(f"\n⏹ Early stopping at epoch {epoch+1} "
-                            f"(composite score not improving for {config['early_stopping_patience']} evaluations)")
-                        break
+                # --- Early Stopping: val_loss 기반 ---
+                if early_stopping(val_loss):
+                    print(f"\n⏹ Early stopping at epoch {epoch+1} "
+                        f"(val_loss not improving for {config['early_stopping_patience']} evaluations)")
+                    break
 
                 # ✅ evaluation 성공: pending=False로 덮어쓰기
                 save_checkpoint(
                     model, optimizer, scheduler, epoch, val_loss, temp_ckpt_path,
                     best_val_loss=best_val_loss,
-                    best_composite=best_composite,
                     config=config,
                     pending_evaluation=False
                 )
@@ -573,19 +524,15 @@ def train_byol_wafer(config, file_number):
             mem = psutil.virtual_memory()
 
             log_training_info(
-                epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss, uni_loss, current_lr, tau,
+                epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss, current_lr, tau,
                 timing_info, mem, variance_config, collapse_info
             )
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
 
             if epoch == 0 or (epoch + 1) % config['save_frequency'] == 0:
                 save_path = os.path.join(config['save_dir'], f'checkpoint_epoch_{epoch+1}.pth')
                 save_checkpoint(
                     model, optimizer, scheduler, epoch, val_loss, save_path,
                     best_val_loss=best_val_loss,
-                    best_composite=best_composite,
                     config=config
                 )
 
@@ -700,15 +647,12 @@ def get_default_config(path, file_number):
         'variance_margin': 0.1,                # robust margin (0.9~1.1 허용)
         'variance_weight': 0.05,                # loss weight (0.2 -> 0.05)
         'covariance_weight': 0.01,              # 🆕 (0.04 -> 0.1 -> 0.05)
-        'uniformity_weight': 0.005,
         'uniformity_warmup_end': 10,   # 0~9 에폭: uniformity 꺼둠
         'uniformity_rampup_end': 20,   # 10~19 에폭: 0→0.005 선형 증가
 
-        # Composite score weights (early stopping & best model 기준)
-        'composite_weights': {
-            'knn_consistency': 0.5,
-            'silhouette': 0.3,
-            'avg_cos_sim': -0.2,  # 음수 = 낮을수록 좋음
+        'collapse_guard': {
+            'feature_std_min': 0.5,
+            'avg_cos_sim_max': 0.90,
         },
 
         # K in KNN
@@ -720,8 +664,8 @@ def get_default_config(path, file_number):
 
         # Early stopping
         'early_stopping_patience': 6,          # eval_frequence * early_stopping_patience로 실제 early_stopping 적용
-        'early_stopping_delta': 0.01,
-        'early_stopping_mode': 'max',          # min, max 중 하나
+        'early_stopping_delta': 0.001,
+        'early_stopping_mode': 'min',          # min, max 중 하나
 
         # bin category channel
         'n_spatial_channels' : 13,             # BIN Category Channel 수

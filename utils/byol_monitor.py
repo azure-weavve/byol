@@ -47,6 +47,7 @@ class BYOLMonitor:
                 'val_loss': [],
                 'learning_rate': [],
                 'tau': [],
+
                 # 🆕 Variance tracking
                 'byol_loss': [],
                 'variance_loss': [],
@@ -56,12 +57,12 @@ class BYOLMonitor:
                 'target_std': [],
                 'covariance_loss': [],      # 🆕
                 'covariance_weight': [],    # 🆕
-                'uniformity_loss': [],      # 🆕
-                'uniformity_weight': [],    # 🆕
+
                 # Collapse detection
                 'feat_std_collapse': [],
                 'avg_cos_sim_collapse': [],
                 'is_collapsed': [],
+
                 # Evaluation
                 'silhouette': [],
                 'n_clusters': [],
@@ -86,8 +87,7 @@ class BYOLMonitor:
         self.history['tau'].append(tau)
     
     def log_variance_metrics(self, epoch, byol_loss, variance_loss, variance_weight,
-                            feature_std, avg_cos_sim, target_std=1.0, covariance_loss=0.0, covariance_weight=0.0,
-                            uniformity_loss=0.0, uniformity_weight=0.0):
+                        feature_std, avg_cos_sim, target_std=1.0, covariance_loss=0.0, covariance_weight=0.0):
         """
         🆕 Log variance regularization metrics
         
@@ -108,8 +108,6 @@ class BYOLMonitor:
         self.history['feature_std'].append(feature_std)
         self.history['avg_cos_sim'].append(avg_cos_sim)
         self.history['target_std'].append(target_std)
-        self.history['uniformity_loss'].append(uniformity_loss)    # 🆕
-        self.history['uniformity_weight'].append(uniformity_weight) # 🆕
     
     def log_collapse_detection(self, epoch, feat_std, avg_cos_sim, is_collapsed):
         """Log collapse detection metrics"""
@@ -168,9 +166,6 @@ class BYOLMonitor:
             if self.history.get('covariance_loss') and any(v > 0 for v in self.history['covariance_loss']):
                 ax.plot(epochs, self.history['covariance_loss'], label='Covariance Loss',
                        linewidth=2, color='green', linestyle='--')
-            if self.history.get('uniformity_loss') and any(v > 0 for v in self.history['uniformity_loss']):
-                ax.plot(epochs, self.history['uniformity_loss'], label='Uniformity Loss',
-                    linewidth=2, color='purple', linestyle=':')  # 🆕
             ax.set_xlabel('Epoch')
             ax.set_ylabel('Loss')
             ax.set_title('Loss Components')
