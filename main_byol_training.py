@@ -131,6 +131,28 @@ def load_wafer_data(data_configs, use_filter=True, use_density_aware=False, use_
     return wafer_maps, labels, info
     
 
+def get_uniformity_weight(epoch, config):
+    """
+    Warmup 후 uniformity weight를 점진적으로 증가
+    
+    epoch 0~9:   0.0     (byol이 기본 패턴 먼저 학습)
+    epoch 10~19: 0.001   (약하게 시작)
+    epoch 20~:   0.005   (목표 weight)
+    """
+    warmup_end    = config.get('uniformity_warmup_end', 10)
+    rampup_end    = config.get('uniformity_rampup_end', 20)
+    target_weight = config.get('uniformity_weight', 0.005)
+    
+    if epoch < warmup_end:
+        return 0.0
+    elif epoch < rampup_end:
+        # 선형 증가
+        progress = (epoch - warmup_end) / (rampup_end - warmup_end)
+        return target_weight * progress
+    else:
+        return target_weight
+    
+
 
 def train_byol_wafer(config, file_number):
     """
@@ -302,6 +324,7 @@ def train_byol_wafer(config, file_number):
                 'margin': config.get('variance_margin', 0.1),
                 'weight': config.get('variance_weight', 0.0),
                 'covariance_weight': config.get('covariance_weight', 0.0),
+                'uniformity_weight': get_uniformity_weight(epoch, config),  # ← 변경
             }
 
             # Get current tau for EMA update
@@ -313,7 +336,7 @@ def train_byol_wafer(config, file_number):
             for retry in range(max_retries):
                 try:
                     t0 = time.time()
-                    train_loss, byol_loss, var_loss, cov_loss, feat_std, avg_cos_sim = train_byol_epoch(
+                    train_loss, byol_loss, var_loss, cov_loss, uni_loss, feat_std, avg_cos_sim = train_byol_epoch(
                         model, train_loader, optimizer, device,
                         tau=tau, augmentation=aug_weak, augmentation_strong=aug_strong, epoch=epoch, variance_config=variance_config, verbose=False
                     )
@@ -377,6 +400,8 @@ def train_byol_wafer(config, file_number):
                 feature_std=feat_std,
                 avg_cos_sim=avg_cos_sim,
                 target_std=variance_config.get('target_std', 1.0),
+                uniformity_loss=uni_loss,                                    # 🆕
+                uniformity_weight=variance_config.get('uniformity_weight', 0.0)  # 🆕
             )
             monitor.log_collapse_detection(
                 epoch, collapse_info['feat_std'],
@@ -524,9 +549,12 @@ def train_byol_wafer(config, file_number):
             mem = psutil.virtual_memory()
 
             log_training_info(
-                epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss, current_lr, tau,
+                epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss, uni_loss, current_lr, tau,
                 timing_info, mem, variance_config, collapse_info
             )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
 
             if epoch == 0 or (epoch + 1) % config['save_frequency'] == 0:
                 save_path = os.path.join(config['save_dir'], f'checkpoint_epoch_{epoch+1}.pth')
@@ -647,6 +675,9 @@ def get_default_config(path, file_number):
         'variance_margin': 0.1,                # robust margin (0.9~1.1 허용)
         'variance_weight': 0.05,                # loss weight (0.2 -> 0.05)
         'covariance_weight': 0.01,              # 🆕 (0.04 -> 0.1 -> 0.05)
+        'uniformity_weight': 0.005,
+        'uniformity_warmup_end': 10,   # 0~9 에폭: uniformity 꺼둠
+        'uniformity_rampup_end': 20,   # 10~19 에폭: 0→0.005 선형 증가
 
         'collapse_guard': {
             'feature_std_min': 0.5,
@@ -672,9 +703,9 @@ def get_default_config(path, file_number):
         'save_dir': 'checkpoints_'+file_number,
         'log_dir': 'logs_'+file_number,
         'resume_path': None
-        # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/best_model.pth"
-        # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/checkpoint_epoch_30.pth"
-        # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints/temp_checkpoint.pth"
+        # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints_{file_number}/best_model.pth"
+        # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints_{file_number}/checkpoint_epoch_30.pth"
+        # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints_{file_number}/temp_checkpoint.pth"
     }
 
     return config

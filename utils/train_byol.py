@@ -15,6 +15,25 @@ import time
 import torch.nn.functional as F
 
 
+
+def compute_uniformity_loss(features, t=2):
+    """
+    Uniformity loss: latent space에서 샘플들이 균등하게 분포하도록 강제
+    Wang & Isola (2020)
+    
+    Args:
+        features: [batch_size, dim] — projector output
+        t: temperature (default: 2)
+    Returns:
+        loss: scalar
+    """
+    # L2 normalize
+    z = F.normalize(features, dim=1)
+    # 모든 쌍의 squared L2 distance
+    sq_dist = torch.pdist(z, p=2).pow(2)
+    return sq_dist.mul(-t).exp().mean().log()
+
+
 def compute_variance_loss(features):
     """
     Feature variance를 유지하도록 regularization
@@ -143,11 +162,13 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
     variance_type = variance_config.get('type', 'original')
     variance_weight = variance_config.get('weight', 0.0)
     covariance_weight = variance_config.get('covariance_weight', 0.0)
+    uniformity_weight = variance_config.get('uniformity_weight', 0.0)
 
     total_loss = 0.0
     total_byol_loss = 0.0
     total_var_loss = 0.0
     total_cov_loss = 0.0  # 기존 total_var_loss 아래에 추가
+    total_uni_loss = 0.0  # 초기화 (루프 밖 상단에)
     total_feat_std = 0.0
     total_cos_sim = 0.0
     total_batches = 0
@@ -215,6 +236,12 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
             else: 
                 cov_loss = torch.tensor(0.0, device=device)
 
+            # uniformity_loss
+            if uniformity_weight > 0:
+                uni_loss = compute_uniformity_loss(encoder_features)
+            else:
+                uni_loss = torch.tensor(0.0, device=device)
+
             # Cosine similarity (monitoring용)
             with torch.no_grad(): 
                 normalized = encoder_features / (encoder_features.norm(dim=1, keepdim=True) + 1e-8) 
@@ -231,10 +258,11 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
                 total_cos_sim += avg_cos_sim_batch
 
             # Total loss
-            total_loss_batch = byol_loss + (variance_weight * var_loss) + (covariance_weight * cov_loss)
+            total_loss_batch = byol_loss + (variance_weight * var_loss) + (covariance_weight * cov_loss) - (uniformity_weight * uni_loss)
         else:
             var_loss = torch.tensor(0.0, device=device)
             cov_loss = torch.tensor(0.0, device=device)  # 🆕
+            uni_loss = torch.tensor(0.0, device=device)
             current_std = 0.0
             avg_cos_sim_batch = 0.0
             byol_loss, encoder_features, projector_features = model(
@@ -254,6 +282,7 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
         total_byol_loss += byol_loss.item()
         total_var_loss += var_loss.item()
         total_cov_loss += cov_loss.item()
+        total_uni_loss += uni_loss.item()
         total_batches += 1
 
         # Print progress
@@ -264,6 +293,7 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
                       f"BYOL: {byol_loss.item():.4f}, "
                       f"Var: {var_loss.item():.4f}, "
                       f"Cov: {cov_loss.item():.4f}, "
+                      f"Uni: {uni_loss.item():.4f}, "
                       f"FeatStd: {current_std:.4f}, "
                       f"Tau: {tau:.4f}")
             else:
@@ -275,11 +305,12 @@ def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, au
     avg_byol_loss = total_byol_loss / total_batches
     avg_var_loss = total_var_loss / total_batches
     avg_cov_loss = total_cov_loss / total_batches
+    avg_uni_loss = total_uni_loss / total_batches
     has_reg = (variance_weight > 0 or covariance_weight > 0)
     avg_feat_std = total_feat_std / total_batches if has_reg else 0.0
     avg_cos_sim = total_cos_sim / total_batches if has_reg else 0.0
     
-    return avg_total_loss, avg_byol_loss, avg_var_loss, avg_cov_loss, avg_feat_std, avg_cos_sim
+    return avg_total_loss, avg_byol_loss, avg_var_loss, avg_cov_loss, avg_uni_loss, avg_feat_std, avg_cos_sim
 
 
 def validate_byol_epoch(model, dataloader, device, augmentation, augmentation_strong=None, verbose=True):
@@ -603,7 +634,7 @@ def detect_collapse(features, threshold_std=0.01, threshold_cosine=0.99):
     return is_collapsed, info
 
 
-def log_training_info(epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss, learning_rate, tau, timing_info, mem, variance_config, collapse_info=None):
+def log_training_info(epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss, uni_loss, learning_rate, tau, timing_info, mem, variance_config, collapse_info=None):
     """
     Log training information
 
@@ -619,13 +650,14 @@ def log_training_info(epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss
     eval_time = f"{timing_info['evaluate']:.2f}s" if timing_info['evaluate'] is not None else "Not evaluated"
     variance_weight=variance_config['weight']
     covariance_weight=variance_config.get('covariance_weight', 0.0)
+    uniformity_weight=variance_config.get('uniformity_weight', 0.0)
 
     print(f"\n{'='*60}")
     print(f"Epoch {epoch+1} Summary")
     print(f"{'='*60}")
     print(f"Train Loss: {train_loss:.6f} / Val Loss: {val_loss:.6f} ")
-    print(f"  BYOL Loss: {byol_loss:.6f}, Var Loss: {var_loss:.6f}, Cov Loss: {cov_loss:.6f}")
-    print(f"  BYOL Loss: {(byol_loss/train_loss)*100:.2f}%, Var Loss: {(var_loss*variance_weight)*100:.2f}%, Cov Loss: {(cov_loss*covariance_weight)*100:.2f}%")
+    print(f"  BYOL Loss: {byol_loss:.6f}, Var Loss: {var_loss:.6f}, Cov Loss: {cov_loss:.6f}, Uni Loss: {uni_loss:.6f}")
+    print(f"  BYOL Loss: {(byol_loss/train_loss)*100:.2f}%, Var Loss: {(var_loss*variance_weight/train_loss)*100:.2f}%, Cov Loss: {(cov_loss*covariance_weight/train_loss)*100:.2f}%, Uni Loss: {(uni_loss*uniformity_weight*-1/train_loss)*100:.2f}%")
     print(f"Learning Rate: {learning_rate:.6e} / Tau (EMA): {tau:.6f}")
     print(f"Time:")
     print(f"  Train: {timing_info['train']:.2f}s / Valid: {timing_info['validate']:.2f}s / Collapse Detection: {timing_info['collapse_detection']:.2f}s / Evaluate: {eval_time} / Total: {timing_info['total']:.2f}s")

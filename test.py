@@ -1,744 +1,757 @@
 """
-Training loop for BYOL
+Main BYOL Training Script
 
-Functions:
-- train_byol_epoch: single epoch training
-- validate_byol_epoch: validation
-- train_byol: full training pipeline
+Complete training pipeline for BYOL-based wafer pattern clustering
 
-PyTorch 1.4.0 compatible
+Usage:
+    python main_byol_training.py [--config CONFIG_PATH] [--resume CHECKPOINT_PATH]
 """
 
 import torch
 import torch.nn as nn
+import torch.optim as optim
+import argparse
+import os
+import sys
 import time
-import torch.nn.functional as F
+import math
+from datetime import datetime
+import numpy as np
+import json
+import psutil
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from models.byol import BYOL, get_tau_schedule
+from utils.batch_augmentation import get_batch_byol_augmentation
+from utils.train_byol import (
+    train_byol_epoch, validate_byol_epoch, extract_features,
+    save_checkpoint, load_checkpoint, EarlyStopping, detect_collapse, log_training_info
+)
+from utils.evaluation import evaluate_all, print_evaluation_results
+from utils.byol_monitor import BYOLMonitor, visualize_latent_space
+from utils.dataloader_utils import prepare_clean_data, create_dataloaders, recreate_dataloaders, collate_fn
+from utils.gpu_monitor import print_gpu_memory, reset_peak_stats, get_peak_memory_mb
+
+# S3 접속
+import boto3
+
+client = boto3.client(
+    service_name='s3',
+    aws_access_key_id="AKIA1B073F6BABAA9CB2", # AccessKey
+    aws_secret_access_key="EK+4wZE2ie/OEWRD8aX8ONlN3iWRl2jB3np7HCks", # AccessSecretKey
+    endpoint_url='http://s3.dataplatform.samsungds.net:9020'
+) 
 
 
 
-def compute_uniformity_loss(features, t=2):
+class CosineAnnealingWarmUpRestarts(optim.lr_scheduler._LRScheduler):
     """
-    Uniformity loss: latent space에서 샘플들이 균등하게 분포하도록 강제
-    Wang & Isola (2020)
-    
+    Cosine annealing with warm restarts and warmup
+    PyTorch 1.4.0 compatible implementation
+    """
+    def __init__(self, optimizer, T_0, T_mult=1, eta_max=0.1, T_up=0, gamma=1.0, last_epoch=-1):
+        self.T_0 = T_0
+        self.T_mult = T_mult
+        self.eta_max = eta_max
+        self.T_up = T_up
+        self.gamma = gamma
+        self.T_cur = last_epoch
+        self.T_i = T_0
+        self.cycle = 0
+        super(CosineAnnealingWarmUpRestarts, self).__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.T_cur == -1:
+            return self.base_lrs
+        elif self.T_cur < self.T_up:
+            return [(self.eta_max - base_lr) * self.T_cur / self.T_up + base_lr for base_lr in self.base_lrs]
+        else:
+            return [base_lr + (self.eta_max - base_lr) * (1 + math.cos(math.pi * (self.T_cur - self.T_up) / (self.T_i - self.T_up))) / 2
+                    for base_lr in self.base_lrs]
+
+    def step(self, epoch=None):
+        if epoch is None:
+            epoch = self.last_epoch + 1
+            self.T_cur = self.T_cur + 1
+            if self.T_cur >= self.T_i:
+                self.cycle += 1
+                self.T_cur = self.T_cur - self.T_i
+                self.T_i = self.T_i * self.T_mult
+        else:
+            if epoch < 0:
+                raise ValueError("Expected non-negative epoch")
+            if epoch >= self.T_0:
+                if self.T_mult == 1:
+                    self.T_cur = epoch % self.T_0
+                    self.cycle = epoch // self.T_0
+                else:
+                    n = int(math.log((epoch / self.T_0 * (self.T_mult - 1) + 1), self.T_mult))
+                    self.cycle = n
+                    self.T_cur = epoch - self.T_0 * (self.T_mult ** n - 1) / (self.T_mult - 1)
+                    self.T_i = self.T_0 * self.T_mult ** n
+            else:
+                self.T_i = self.T_0
+                self.T_cur = epoch
+        self.last_epoch = math.floor(epoch)
+
+        for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
+            param_group['lr'] = lr
+
+
+def load_wafer_data(data_configs, use_filter=True, use_density_aware=False, use_region_aware=False):
+    """
+    Load and prepare wafer data from multiple sources
+
     Args:
-        features: [batch_size, dim] — projector output
-        t: temperature (default: 2)
-    Returns:
-        loss: scalar
-    """
-    # L2 normalize
-    z = F.normalize(features, dim=1)
-    # 모든 쌍의 squared L2 distance
-    sq_dist = torch.pdist(z, p=2).pow(2)
-    return sq_dist.mul(-t).exp().mean().log()
+        data_configs: List of dicts with 'path' and 'name' keys
+                     Example: [{"path": "data.npz", "name": "product1"}]
+        use_filter: Whether to apply wafer map filtering
+        use_density_aware: Use density-aware adaptive filtering (recommended)
+        use_region_aware: Use region-aware filtering for very low density maps
 
-
-def compute_variance_loss(features):
-    """
-    Feature variance를 유지하도록 regularization
-    
-    Args:
-        features: [batch_size, dim]
-    
     Returns:
-        loss: variance가 낮으면 패널티
+        wafer_maps: List of numpy arrays
+        labels: List of labels
+        info: List of filter info dicts
     """
-    # 각 dimension의 std 계산
-    std_per_dim = features.std(dim=0)  # (dim,)
-    
-    # Std가 낮으면 loss 증가
-    # -log(std)를 사용하면 std가 0에 가까울수록 loss 무한대
-    variance_loss = -torch.log(std_per_dim.mean() + 1e-6)
-    
-    return variance_loss
+    if not data_configs or len(data_configs) == 0:
+        raise ValueError("data_configs must be provided with at least one dataset")
 
-def compute_variance_loss_target_std(features, target_std=1.0, adaptive=False):
+    # Load and clean data
+    wafer_maps, labels, info = prepare_clean_data(
+        data_configs,
+        use_filter=use_filter,
+        filter_params=None,
+        use_density_aware=use_density_aware,
+        use_region_aware=use_region_aware
+    )
+
+    return wafer_maps, labels, info
+
+# 🆕 Composite score 계산 함수
+def compute_composite_score(eval_metrics, avg_cos_sim, weights):
     """
-    Feature std를 target 값에 맞추는 loss
-    
-    Args:
-        features: [batch_size, dim]
-        target_std: 목표 std (default: 1.0)
-        adaptive: True면 dimension별로 다른 target 허용
-    
-    Returns:
-        loss: scalar
-        current_std: 현재 평균 std
+    Composite score = silhouette * w1 + rotation_inv * w2 + avg_cos_sim * w3
+    (w3는 음수이므로 cos_sim이 높으면 페널티)
+
+    변경된 Composite score:
+    knn_consistency * 0.5 + silhouette * 0.3 + avg_cos_sim * (-0.2)
+
+    기존 rotation_invariance 제거, knn_consistency 추가
     """
-    # Dimension별 std 계산
-    std_per_dim = features.std(dim=0)  # (dim,)
+    clustering = eval_metrics.get('clustering', {})
+    knn = eval_metrics.get('knn_consistency', {})
+
+    silhouette = clustering.get('silhouette')
+    knn_consistency = knn.get('knn_consistency')
+
+    # 하나라도 없으면 계산 불가
+    if silhouette is None or knn_consistency is None:
+        return None
+
+    score = (knn_consistency * weights.get('knn_consistency', 0.5)
+             + silhouette * weights.get('silhouette', 0.3)
+             + avg_cos_sim * weights.get('avg_cos_sim', -0.2))
+
+    return score, knn_consistency, silhouette
+
+def get_uniformity_weight(epoch, config):
+    """
+    Warmup 후 uniformity weight를 점진적으로 증가
     
-    if adaptive:
-        # Dimension별로 조정 (일부 dim은 중요도 높음)
-        # 현재는 단순 평균
-        avg_std = std_per_dim.mean()
+    epoch 0~9:   0.0     (byol이 기본 패턴 먼저 학습)
+    epoch 10~19: 0.001   (약하게 시작)
+    epoch 20~:   0.005   (목표 weight)
+    """
+    warmup_end    = config.get('uniformity_warmup_end', 10)
+    rampup_end    = config.get('uniformity_rampup_end', 20)
+    target_weight = config.get('uniformity_weight', 0.005)
+    
+    if epoch < warmup_end:
+        return 0.0
+    elif epoch < rampup_end:
+        # 선형 증가
+        progress = (epoch - warmup_end) / (rampup_end - warmup_end)
+        return target_weight * progress
     else:
-        avg_std = std_per_dim.mean()
+        return target_weight
     
-    # MSE loss to target
-    loss = (avg_std - target_std) ** 2
-    
-    return loss, avg_std.item()
 
 
-def compute_variance_loss_robust(features, target_std=1.0, margin=0.1):
+def train_byol_wafer(config, file_number):
     """
-    더 robust한 버전: margin 내에서는 패널티 없음
-    
-    target_std = 1.0, margin = 0.1이면
-    → 0.9 ~ 1.1 범위는 패널티 0
-    → 범위 밖이면 패널티
-    """
-    std_per_dim = features.std(dim=0)
-    avg_std = std_per_dim.mean()
-    
-    # Margin 밖이면 패널티
-    lower_bound = target_std - margin
-    upper_bound = target_std + margin
-    
-    if avg_std < lower_bound:
-        loss = (avg_std - lower_bound) ** 2
-    elif avg_std > upper_bound:
-        loss = (avg_std - upper_bound) ** 2
-    else:
-        loss = torch.tensor(0.0, device=features.device)
-    
-    return loss, avg_std.item()
-
-def compute_covariance_loss(features):
-    """
-    VICReg style covariance regularization
-    차원 간 상관관계를 제거하여 directional collapse 방지
-    
-    Args:
-        features: [batch_size, dim]
-    Returns:
-        loss: scalar
-    """
-    N, D = features.shape
-    
-    # 평균 제거
-    features_centered = features - features.mean(dim=0)
-    
-    # Covariance matrix (D, D)
-    cov = (features_centered.T @ features_centered) / max(N - 1, 1)
-    
-    # Off-diagonal 원소의 제곱합
-    diag = torch.diag(torch.diag(cov))
-    off_diag = cov - diag
-    
-    loss = (off_diag ** 2).sum() / D
-    
-    return loss
-
-
-def train_byol_epoch(model, dataloader, optimizer, device, tau, augmentation, augmentation_strong=None, epoch=0, total_epochs=100, variance_config=None, verbose=True):
-    """
-    Train BYOL for one epoch
+    Main training function
 
     Args:
-        model: BYOL model
-        dataloader: training data loader
-        optimizer: optimizer (e.g., AdamW)
-        device: torch device
-        tau: EMA momentum for this epoch
-        augmentation: augmentation function (BYOLAugmentation)
-        epoch: current epoch number
-        verbose: print progress
-        variance_config: {
-            'type': 'target_std',  # or 'target_std_robust'
-            'target_std': 1.0,
-            'margin': 0.1,         # for robust version
-            'weight': 0.2
-        }
-
-    Returns:
-        avg_loss: average loss for the epoch
-        avg_cos_sim: average cosine similarity
+        config: dict with training configuration
     """
-    model.train()
-
-    variance_type = variance_config.get('type', 'original')
-    variance_weight = variance_config.get('weight', 0.0)
-    covariance_weight = variance_config.get('covariance_weight', 0.0)
-    uniformity_weight = variance_config.get('uniformity_weight', 0.0)
-
-    total_loss = 0.0
-    total_byol_loss = 0.0
-    total_var_loss = 0.0
-    total_cov_loss = 0.0  # 기존 total_var_loss 아래에 추가
-    total_uni_loss = 0.0  # 초기화 (루프 밖 상단에)
-    total_feat_std = 0.0
-    total_cos_sim = 0.0
-    total_batches = 0
-
-    total_batches_count = len(dataloader)
-
-    for batch_idx, data in enumerate(dataloader):
-        # Get data (handle multiple return formats)
-        if isinstance(data, (list, tuple)):
-            if len(data) == 4:
-                # From dataloader_utils: (images, images_aug, labels, indices)
-                images = data[0]
-                # Ignore data[1] (augmented), data[2] (labels), data[3] (indices)
-                # BYOL will apply its own augmentation
-            else:
-                # Standard format: (images, labels) or just images
-                images = data[0] if len(data) > 0 else data
-        else:
-            images = data
-
-        images = images.to(device)
-        batch_size = images.size(0)
-
-        # Generate two augmented views (batch vectorized)
-        view1 = augmentation(images) # weak (C4만 또는 약한 dropout)
-        if augmentation_strong is not None:
-            view2 = augmentation_strong(images) # strong (C4 + 강한 dropout)
-        else:
-            view2 = augmentation(images) # 기존과 동일 (symmetric)
-
-        # Forward pass
-        optimizer.zero_grad()
-
-        # 1. BYOL loss (+ features for regularization)
-        if variance_weight >0 or covariance_weight > 0:
-            byol_loss, encoder_features, projector_features = model(
-                view1, view2, return_projections=True
-            )
-
-            # Variance loss — encoder output (512d)
-            if variance_weight > 0:
-                if variance_type == 'target_std':
-                    var_loss, current_std = compute_variance_loss_target_std(
-                        encoder_features, 
-                        target_std=variance_config.get('target_std', 1.0)
-                    )
-                elif variance_type == 'target_std_robust':
-                    var_loss, current_std = compute_variance_loss_robust(
-                        encoder_features, 
-                        target_std=variance_config.get('target_std', 1.0), 
-                        margin=variance_config.get('margin', 0.1)
-                    )
-                else:
-                    var_loss = compute_variance_loss(encoder_features)
-                    current_std = encoder_features.std(dim=0).mean().item()
-            else:
-                var_loss = torch.tensor(0.0, device=device)
-                current_std = encoder_features.std(dim=0).mean().item()
-            
-            total_feat_std += current_std
-
-            # Covariance loss — projector output (256d)
-            if covariance_weight > 0:
-                cov_loss = compute_covariance_loss(projector_features)
-            else: 
-                cov_loss = torch.tensor(0.0, device=device)
-
-            # uniformity_loss
-            if uniformity_weight > 0:
-                uni_loss = compute_uniformity_loss(encoder_features)
-            else:
-                uni_loss = torch.tensor(0.0, device=device)
-
-            # Cosine similarity (monitoring용)
-            with torch.no_grad(): 
-                normalized = encoder_features / (encoder_features.norm(dim=1, keepdim=True) + 1e-8) 
-                n_samples = min(100, encoder_features.size(0))
-                
-                if n_samples >= 2: 
-                    indices = torch.randperm(encoder_features.size(0))[:n_samples] 
-                    sample_features = normalized[indices] 
-                    cos_sim_matrix = torch.mm(sample_features, sample_features.T) 
-                    mask = ~torch.eye(n_samples, dtype=torch.bool, device=device) 
-                    avg_cos_sim_batch = cos_sim_matrix[mask].mean().item() 
-                else: 
-                    avg_cos_sim_batch = 0.0 
-                total_cos_sim += avg_cos_sim_batch
-
-            # Total loss
-            total_loss_batch = byol_loss + (variance_weight * var_loss) + (covariance_weight * cov_loss) - (uniformity_weight * uni_loss)
-        else:
-            var_loss = torch.tensor(0.0, device=device)
-            cov_loss = torch.tensor(0.0, device=device)  # 🆕
-            uni_loss = torch.tensor(0.0, device=device)
-            current_std = 0.0
-            avg_cos_sim_batch = 0.0
-            byol_loss, encoder_features, projector_features = model(
-                view1, view2, return_projections=True
-            )
-            total_loss_batch = byol_loss
-
-        # Backward pass
-        total_loss_batch.backward()
-        optimizer.step()
-
-        # Update target network with EMA
-        model.update_target_network(tau=tau)
-
-        # Track metrics
-        total_loss += total_loss_batch.item()
-        total_byol_loss += byol_loss.item()
-        total_var_loss += var_loss.item()
-        total_cov_loss += cov_loss.item()
-        total_uni_loss += uni_loss.item()
-        total_batches += 1
-
-        # Print progress
-        if verbose and (batch_idx % 5 == 0 or batch_idx == total_batches_count - 1):
-            if variance_weight > 0:
-                print(f"Epoch {epoch+1} [Train] [{batch_idx+1}/{total_batches_count}] "
-                    f"Total: {total_loss_batch.item():.4f}, "
-                      f"BYOL: {byol_loss.item():.4f}, "
-                      f"Var: {var_loss.item():.4f}, "
-                      f"Cov: {cov_loss.item():.4f}, "
-                      f"Uni: {uni_loss.item():.4f}, "
-                      f"FeatStd: {current_std:.4f}, "
-                      f"Tau: {tau:.4f}")
-            else:
-                print(f"Epoch {epoch+1} [Train] [{batch_idx+1}/{total_batches_count}] "
-                    f"Loss: {total_loss_batch.item():.4f}")
-
-    # Calculate averages
-    avg_total_loss = total_loss / total_batches
-    avg_byol_loss = total_byol_loss / total_batches
-    avg_var_loss = total_var_loss / total_batches
-    avg_cov_loss = total_cov_loss / total_batches
-    avg_uni_loss = total_uni_loss / total_batches
-    has_reg = (variance_weight > 0 or covariance_weight > 0)
-    avg_feat_std = total_feat_std / total_batches if has_reg else 0.0
-    avg_cos_sim = total_cos_sim / total_batches if has_reg else 0.0
-    
-    return avg_total_loss, avg_byol_loss, avg_var_loss, avg_cov_loss, avg_uni_loss, avg_feat_std, avg_cos_sim
-
-
-def validate_byol_epoch(model, dataloader, device, augmentation, augmentation_strong=None, verbose=True):
-    """
-    Validate BYOL for one epoch
-
-    Args:
-        model: BYOL model
-        dataloader: validation data loader
-        device: torch device
-        augmentation: augmentation function
-        verbose: print progress
-
-    Returns:
-        avg_loss: average validation loss
-    """
-    model.eval()
-
-    total_loss = 0.0
-    total_batches = 0
-
-    total_batches_count = len(dataloader)
-
-    with torch.no_grad():
-        for batch_idx, data in enumerate(dataloader):
-            # Get data (handle multiple return formats)
-            if isinstance(data, (list, tuple)):
-                if len(data) == 4:
-                    # From dataloader_utils: (images, images_aug, labels, indices)
-                    images = data[0]
-                else:
-                    # Standard format: (images, labels) or just images
-                    images = data[0] if len(data) > 0 else data
-            else:
-                images = data
-
-            images = images.to(device)
-            batch_size = images.size(0)
-
-            # Generate two augmented views (batch vectorized)
-            view1 = augmentation(images)
-            if augmentation_strong is not None:
-                view2 = augmentation_strong(images)
-            else:
-                view2 = augmentation(images)
-
-            # Forward pass
-            loss = model(view1, view2)
-
-            # Track metrics
-            total_loss += loss.item()
-            total_batches += 1
-
-            # Print progress
-            if verbose and (batch_idx % 10 == 0 or batch_idx == total_batches_count - 1):
-                print(f"Validation [{batch_idx+1}/{total_batches_count}] Loss: {loss.item():.4f}")
-
-    avg_loss = total_loss / total_batches
-
-    return avg_loss
-
-
-def extract_features(model, dataloader, device, use_target=True, verbose=True, keep_images_n=0):
-    """
-    Extract features from all data
-
-    Args:
-        model: BYOL model
-        dataloader: data loader
-        device: torch device
-        use_target: use target encoder (recommended)
-        verbose: print progress
-        keep_images_n: 앞에서 n개 이미지를 CPU tensor로 저장해서 반환 (0이면 None 반환)
-
-    Returns:
-        features: (N, D) tensor of all features
-        labels: (N,) tensor of labels (if available)
-        sample_images: (keep_images_n, C, H, W) tensor or None
-    """
-    model.eval()
-
-    all_features = []
-    all_labels = []
-    sample_images = [] if keep_images_n > 0 else None
-
-    total_batches_count = len(dataloader)
-
-    with torch.no_grad():
-        for batch_idx, data in enumerate(dataloader):
-            # Get data (handle multiple return formats)
-            if isinstance(data, (list, tuple)):
-                if len(data) == 4:
-                    # From dataloader_utils: (images, images_aug, labels, indices)
-                    images = data[0]
-                    labels = data[2]  # labels는 list!
-                elif len(data) > 1:
-                    images = data[0]
-                    labels = data[1]
-                else:
-                    images = data[0] if len(data) > 0 else data
-                    labels = None
-            else:
-                images = data
-                labels = None
-
-            # sample_images 수집 (keep_images_n개 채울 때까지)
-            if sample_images is not None:
-                already_collected = sum(t.size(0) for t in sample_images)
-                if already_collected < keep_images_n:
-                    remaining = keep_images_n - already_collected
-                    sample_images.append(images[:remaining].cpu())
-
-            images = images.to(device)
-
-            # Extract features
-            features = model.get_embeddings(images, use_target=use_target)
-            all_features.append(features.cpu())
-            
-            # ✅ 수정: labels를 올바르게 처리
-            if labels is not None:
-                # labels가 list라면 tensor로 변환 필요
-                if isinstance(labels, list):
-                    # 숫자로 변환 가능하면 tensor로
-                    try:
-                        labels_tensor = torch.tensor(labels, dtype=torch.long)
-                        all_labels.append(labels_tensor)
-                    except (ValueError, TypeError):
-                        # 문자열 라벨이면 그냥 list로 유지
-                        all_labels.extend(labels)
-                elif isinstance(labels, torch.Tensor):
-                    all_labels.append(labels.cpu())
-                else:
-                    # 다른 형식이면 list로 추가
-                    if isinstance(labels, (list, tuple)):
-                        all_labels.extend(labels)
-                    else:
-                        all_labels.append(labels)
-
-            # Print progress
-            if verbose and (batch_idx % 10 == 0 or batch_idx == total_batches_count - 1):
-                print(f"Extracting features [{batch_idx+1}/{total_batches_count}]")
-
-    # Concatenate all features
-    all_features = torch.cat(all_features, dim=0)
-
-    if sample_images is not None:
-        sample_images = torch.cat(sample_images, dim=0)[:keep_images_n]
-
-    # ✅ 수정: labels 처리
-    if len(all_labels) > 0:
-        # 첫 번째 원소가 tensor인지 list인지 확인
-        if isinstance(all_labels[0], torch.Tensor):
-            all_labels = torch.cat(all_labels, dim=0)
-            return all_features, all_labels, sample_images
-        else:
-            # list of strings/mixed types
-            return all_features, all_labels, sample_images
-    else:
-        return all_features, None, sample_images
-
-
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, filepath, best_val_loss=None, **kwargs):
-    """
-    Save checkpoint
-
-    Args:
-        model: BYOL model
-        optimizer: optimizer
-        scheduler: learning rate scheduler (optional)
-        epoch: current epoch
-        loss: current loss
-        filepath: path to save checkpoint
-        best_val_loss: best validation loss so far (optional)  # 🔴 추가
-        **kwargs: additional info to save
-    """
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-    }
-
-    if scheduler is not None:
-        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
-        
-    # 🔴 best_val_loss 저장
-    if best_val_loss is not None:
-        checkpoint['best_val_loss'] = best_val_loss
-
-    # Add any additional info
-    checkpoint.update(kwargs)
-
-    torch.save(checkpoint, filepath)
-    print(f"Checkpoint saved to {filepath}")
-
-
-def load_checkpoint(model, optimizer, scheduler, filepath, device):
-    """
-    Load checkpoint
-
-    Args:
-        model: BYOL model
-        optimizer: optimizer
-        scheduler: learning rate scheduler (optional)
-        filepath: path to checkpoint
-        device: torch device
-
-    Returns:
-        epoch: epoch to resume from
-        loss: loss at checkpoint
-        best_val_loss: best validation loss (if available)
-        best_composite: best composite score (if available)
-        pending_evaluation: whether evaluation was interrupted (if available)
-    """
-    checkpoint = torch.load(filepath, map_location=device)
-
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-    epoch = checkpoint['epoch']
-    loss = checkpoint['loss']
-    best_val_loss = checkpoint.get('best_val_loss', float('inf'))  # 🔴 추가
-    best_composite = checkpoint.get('best_composite', -float('inf'))  # 추가
-    pending_evaluation = checkpoint.get('pending_evaluation', False)
-
-    print(f"Checkpoint loaded from {filepath}")
-    print(f"Resuming from epoch {epoch+1}, loss: {loss:.4f}, best_val_loss: {best_val_loss:.4f}, best_composite: {best_composite:.4f}")
-
-    if pending_evaluation:
-        print(f"  ⚠️ Pending evaluation detected for epoch {epoch+1}")
-
-    return epoch, loss, best_val_loss, best_composite, pending_evaluation  # 5개 반환
-
-
-class EarlyStopping:
-    """
-    Early stopping to stop training when validation loss doesn't improve
-    """
-    def __init__(self, patience=10, min_delta=0.0, mode='min'):
-        """
-        Args:
-            patience: number of epochs to wait before stopping
-            min_delta: minimum change to qualify as improvement
-            mode: 'min' or 'max'
-        """
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-
-    def __call__(self, score):
-        """
-        Args:
-            score: current metric value
-
-        Returns:
-            True if should stop training
-        """
-        if self.best_score is None:
-            self.best_score = score
-            return False
-
-        if self.mode == 'min':
-            improved = score < (self.best_score - self.min_delta)
-        else:
-            improved = score > (self.best_score + self.min_delta)
-
-        if improved:
-            self.best_score = score
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-                return True
-
-        return False
-
-
-def detect_collapse(features, threshold_std=0.01, threshold_cosine=0.99):
-    """
-    Detect representation collapse
-
-    Args:
-        features: (B, D) feature tensor
-        threshold_std: minimum std for each dimension
-        threshold_cosine: maximum average cosine similarity
-
-    Returns:
-        is_collapsed: bool
-        info: dict with diagnostic info
-    """
-    # Compute statistics
-    feat_std = features.std(dim=0).mean().item()
-    feat_mean = features.mean(dim=0).mean().item()
-
-    # Normalize features
-    features_norm = features / (features.norm(dim=1, keepdim=True) + 1e-8)
-
-    # Compute pairwise cosine similarity
-    cos_sim_matrix = torch.mm(features_norm, features_norm.t())
-
-    # Average cosine similarity (excluding diagonal)
-    mask = ~torch.eye(cos_sim_matrix.size(0), dtype=torch.bool, device=features.device)
-    avg_cos_sim = cos_sim_matrix[mask].mean().item()
-
-    # Check collapse
-    is_collapsed = (feat_std < threshold_std) or (avg_cos_sim > threshold_cosine)
-
-    info = {
-        'feat_std': feat_std,
-        'feat_mean': feat_mean,
-        'avg_cos_sim': avg_cos_sim,
-        'is_collapsed': is_collapsed
-    }
-
-    return is_collapsed, info
-
-
-def log_training_info(epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss, uni_loss, learning_rate, tau, timing_info, mem, variance_config, collapse_info=None):
-    """
-    Log training information
-
-    Args:
-        epoch: current epoch
-        train_loss: training loss
-        val_loss: validation loss
-        learning_rate: current learning rate
-        tau: current tau value
-        timing_info: dict with keys 'train', 'validate', 'collapse_detection', 'evaluate' (or None), 'total'
-        collapse_info: collapse detection info (optional)
-    """
-    eval_time = f"{timing_info['evaluate']:.2f}s" if timing_info['evaluate'] is not None else "Not evaluated"
-    variance_weight=variance_config['weight']
-    covariance_weight=variance_config.get('covariance_weight', 0.0)
-    uniformity_weight=variance_config.get('uniformity_weight', 0.0)
-
-    print(f"\n{'='*60}")
-    print(f"Epoch {epoch+1} Summary")
-    print(f"{'='*60}")
-    print(f"Train Loss: {train_loss:.6f} / Val Loss: {val_loss:.6f} ")
-    print(f"  BYOL Loss: {byol_loss:.6f}, Var Loss: {var_loss:.6f}, Cov Loss: {cov_loss:.6f}, Uni Loss: {uni_loss:.6f}")
-    print(f"  BYOL Loss: {(byol_loss/train_loss)*100:.2f}%, Var Loss: {(var_loss*variance_weight/train_loss)*100:.2f}%, Cov Loss: {(cov_loss*covariance_weight/train_loss)*100:.2f}%, Uni Loss: {(uni_loss*uniformity_weight*-1/train_loss)*100:.2f}%")
-    print(f"Learning Rate: {learning_rate:.6e} / Tau (EMA): {tau:.6f}")
-    print(f"Time:")
-    print(f"  Train: {timing_info['train']:.2f}s / Valid: {timing_info['validate']:.2f}s / Collapse Detection: {timing_info['collapse_detection']:.2f}s / Evaluate: {eval_time} / Total: {timing_info['total']:.2f}s")
-    print(f"Memory -> Total: {mem.total / 1024**3:.1f} GB / Available: {mem.available / 1024**3:.1f} GB / Used: {mem.used / 1024**3:.1f} GB / Percent: {mem.percent}%")
-
-    if collapse_info is not None:
-        print(f"\nCollapse Detection:")
-        print(f"  Feature Std: {collapse_info['feat_std']:.6f} / Avg Cos Sim: {collapse_info['avg_cos_sim']:.6f} / Collapsed: {collapse_info['is_collapsed']}")
-
-    print(f"{'='*60}\n")
-
-
-def test_training_functions():
-    """Test training functions"""
-    print("Testing training functions...")
-
-    # Create dummy model and data
-    from models.byol import BYOL
-    from utils.augmentation import get_byol_augmentation
-
+    # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+
+    # Create output directories
+    os.makedirs(config['save_dir'], exist_ok=True)
+    os.makedirs(config['log_dir'], exist_ok=True)
+
+    # Data loaders
+    print("\nPreparing data...")
+
+    # Load wafer data
+    wafer_maps, labels, _ = load_wafer_data(
+        data_configs=config['data_configs'],
+        use_filter=config.get('use_filter', True),
+        use_density_aware=config.get('use_density_aware', False),
+        use_region_aware=config.get('use_region_aware', False)
+    )
+
+    if wafer_maps is None or len(wafer_maps) == 0:
+        raise ValueError("Failed to load data. Please check your data_configs paths.")
+    
+    # ✅ Auto-detect input channels
+    n_channels = wafer_maps[0].shape[0]  # (C, H, W)
+    # Safety check
+    for i in range(min(10, len(wafer_maps))):
+        assert wafer_maps[i].shape[0] == n_channels, \
+            f"Channel mismatch at index {i}: {wafer_maps[i].shape[0]} vs {n_channels}"
+    print(f"Detected input channels: {n_channels}")
+
+    # Create dataloaders from real data
+    # IMPORTANT: use_augmentation=False because BYOL applies augmentation in training loop
+    train_loader, val_loader = create_dataloaders(
+        wafer_maps=wafer_maps,
+        labels=labels,
+        batch_size=config['batch_size'],
+        target_size=(config['wafer_size'], config['wafer_size']),
+        test_size=config.get('test_size', 0.2),
+        use_filter=False,  # Already filtered in prepare_clean_data
+        filter_on_the_fly=False,
+        filter_params=None,
+        use_density_aware=False,
+        use_augmentation=False  # BYOL applies augmentation in train_byol_epoch
+    )
+    current_num_workers = train_loader.num_workers  # fallback 추적용
+
+    print(f"Train samples: {len(train_loader.dataset)}")
+    print(f"Val samples: {len(val_loader.dataset)}")
 
     # Create model
+    print("\nCreating BYOL model...")
     model = BYOL(
-        encoder_dim=512,
-        projector_hidden=1024,
-        projector_out=256,
-        predictor_hidden=1024,
-        use_radial_encoding=True,
-        use_attention=True,
-        wafer_size=(128, 128),
-        tau=0.996
+        input_channels=n_channels,  # ✅ 추가
+        encoder_dim=config['encoder_dim'],
+        projector_hidden=config['projector_hidden'],
+        projector_out=config['projector_out'],
+        predictor_hidden=config['predictor_hidden'],
+        use_radial_encoding=config['use_radial_encoding'],
+        use_attention=config['use_attention'],
+        wafer_size=(config['wafer_size'], config['wafer_size']),
+        tau=config['tau_base']
     ).to(device)
+    print_gpu_memory("After Model Creation")
 
-    # Create dummy dataloader
-    dummy_data = torch.randn(32, 1, 128, 128)
-    dataloader = torch.utils.data.DataLoader(
-        torch.utils.data.TensorDataset(dummy_data),
-        batch_size=4,
-        shuffle=True
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+
+    # Optimizer
+    print("\nSetting up optimizer...")
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config['base_lr'],
+        weight_decay=config['weight_decay']
     )
 
-    # Create optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-    # Create augmentation
-    augmentation = get_byol_augmentation('strong')
-
-    # Test training for one epoch
-    print("\nTesting training epoch...")
-    avg_loss = train_byol_epoch(
-        model, dataloader, optimizer, device,
-        tau=0.996, augmentation=augmentation, epoch=0
+    # Learning rate scheduler
+    scheduler = CosineAnnealingWarmUpRestarts(
+        optimizer,
+        T_0=config['T_0'],
+        T_mult=config['T_mult'],
+        eta_max=config['eta_max'],
+        T_up=config['T_up'],
+        gamma=config['gamma']
     )
-    print(f"Average training loss: {avg_loss:.4f}")
 
-    # Test validation
-    print("\nTesting validation...")
-    val_loss = validate_byol_epoch(model, dataloader, device, augmentation)
-    print(f"Validation loss: {val_loss:.4f}")
+    # Augmentation
+    print("Setting up augmentation...")
+    aug_weak = get_batch_byol_augmentation('weak', n_spatial_channels=config.get('n_spatial_channels', 13))
+    aug_strong = get_batch_byol_augmentation('strong', n_spatial_channels=config.get('n_spatial_channels', 13))
 
-    # Test feature extraction
-    print("\nTesting feature extraction...")
-    features, _ = extract_features(model, dataloader, device, use_target=True)
-    print(f"Extracted features shape: {features.shape}")
+    # ✅ 수정: resume 파라미터 전달
+    resume_training = config.get('resume_path') is not None and os.path.exists(config.get('resume_path', ''))
 
-    # Test collapse detection
-    print("\nTesting collapse detection...")
-    is_collapsed, info = detect_collapse(features)
-    print(f"Collapsed: {is_collapsed}")
-    print(f"Info: {info}")
+    # Monitor
+    monitor = BYOLMonitor(
+        log_dir=config['log_dir'],
+        eval_frequency=config['eval_frequency'],
+        save_plots=True,
+        resume=resume_training  # ✅ 자동으로 이전 history 로드
+    )
 
-    print("\nTraining functions test passed!")
+    # Early stopping
+    early_stopping = EarlyStopping(
+        patience=config['early_stopping_patience'],
+        min_delta=config['early_stopping_delta'],
+        mode=config['early_stopping_mode']
+    )
+
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    best_val_loss = float('inf')
+    best_composite = -float('inf')
+    pending_evaluation = False
+
+    if config.get('resume_path') is not None and os.path.exists(config['resume_path']):
+        print(f"\nResuming from checkpoint: {config['resume_path']}")
+        start_epoch, resumed_loss, best_val_loss, best_composite, pending_evaluation = load_checkpoint(
+            model, optimizer, scheduler, config['resume_path'], device
+        )
+
+        if pending_evaluation:
+            # evaluation만 실패 → 같은 epoch에서 evaluation만 재시도
+            print(f"  ⚠️ Epoch {start_epoch+1}의 evaluation 미완료 — evaluation만 재시도 예정")
+        else:
+            # 정상 resume → 다음 epoch부터
+            start_epoch += 1
+
+        print(f"Resumed: start_epoch={start_epoch}, last_loss: {resumed_loss:.4f}, best: {best_val_loss:.4f}")
+
+    # Training loop
+    print(f"\nStarting training for {config['epochs']} epochs...")
+    print("="*60)
+
+    # Peak memory 측정 시작
+    reset_peak_stats()
+    mem = psutil.virtual_memory()
+    print(f"  Before Start Memory - Total: {mem.total / 1024**3:.1f} GB / Available: {mem.available / 1024**3:.1f} GB / Used: {mem.used / 1024**3:.1f} GB / Percent: {mem.percent}%")
+
+    for epoch in range(start_epoch, config['epochs']):
+        epoch_start_time = time.time()
+
+        # =====================================================
+        # 학습 단계 (pending_evaluation이면 건너뜀)
+        # =====================================================
+        skip_training = (pending_evaluation and epoch == start_epoch)
+
+        # ✅ pending_evaluation이면 학습 건너뛰고 바로 평가
+        if skip_training:
+            print(f"\n⏩ Epoch {epoch+1} 학습 건너뜀 — 미완료 evaluation 재시도")
+            # 체크포인트에서 val_loss 복원 (저장 시 사용)
+            val_loss = resumed_loss
+        else:
+            if epoch == start_epoch:
+                print_gpu_memory("Before Training")
+
+            # 🆕 Variance config 준비
+            variance_config = {
+                'type': config.get('variance_type', 'target_std_robust'),
+                'target_std': config.get('variance_target_std', 1.0),
+                'margin': config.get('variance_margin', 0.1),
+                'weight': config.get('variance_weight', 0.0),
+                'covariance_weight': config.get('covariance_weight', 0.0),
+                'uniformity_weight': get_uniformity_weight(epoch, config),  # ← 변경
+            }
+
+            # Get current tau for EMA update
+            tau = get_tau_schedule(epoch, config['epochs'], config['tau_base'], config['tau_max'])
+
+            # Worker 오류 시 num_workers를 줄여서 최대 3회 재시도
+            max_retries = 3
+
+            for retry in range(max_retries):
+                try:
+                    t0 = time.time()
+                    train_loss, byol_loss, var_loss, cov_loss, uni_loss, feat_std, avg_cos_sim = train_byol_epoch(
+                        model, train_loader, optimizer, device,
+                        tau=tau, augmentation=aug_weak, augmentation_strong=aug_strong, epoch=epoch, variance_config=variance_config, verbose=False
+                    )
+                    train_time = time.time() - t0
+
+                    t0 = time.time()
+                    val_loss = validate_byol_epoch(
+                        model, val_loader, device, augmentation=aug_weak, augmentation_strong=aug_strong, verbose=False
+                    )
+                    validate_time = time.time() - t0
+                    break  # 성공 시 루프 탈출
+
+                except (RuntimeError, OSError) as e:
+                    is_worker_error = (
+                        isinstance(e, OSError) and e.errno == 12  # Cannot allocate memory
+                    ) or (
+                        isinstance(e, RuntimeError) and "worker" in str(e).lower()
+                    )
+                    if is_worker_error and retry < max_retries - 1:
+                        current_num_workers = max(0, current_num_workers // 2)
+                        print(f"\n⚠️  DataLoader worker 오류 감지 (retry {retry+1}/{max_retries-1})")
+                        print(f"   num_workers → {current_num_workers} 으로 줄여서 재시도")
+                        train_loader, val_loader = recreate_dataloaders(
+                            train_loader.dataset, val_loader.dataset,
+                            batch_size=config['batch_size'],
+                            num_workers=current_num_workers,
+                            drop_last=True
+                        )
+                    else:
+                        raise  # worker 오류가 아니거나 재시도 소진 시 그대로 raise
+
+            # Update scheduler
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+
+            # Collapse detection
+            t0 = time.time()
+            with torch.no_grad():
+                # Get some features for collapse detection
+                sample_batch = next(iter(val_loader))
+                if isinstance(sample_batch, (list, tuple)):
+                    sample_batch = sample_batch[0]
+                sample_batch = sample_batch[:min(32, len(sample_batch))].to(device)
+                sample_features = model.get_embeddings(sample_batch, use_target=True)
+
+                is_collapsed, collapse_info = detect_collapse(sample_features)
+            collapse_time = time.time() - t0
+            
+            if epoch == start_epoch:
+                print_gpu_memory("After First Epoch (Peak = Max Training Memory)")
+
+            # Log to monitor
+            monitor.log_epoch(epoch, train_loss, val_loss, current_lr, tau)
+            monitor.log_variance_metrics(
+                epoch=epoch,
+                byol_loss=byol_loss,
+                variance_loss=var_loss,
+                covariance_loss=cov_loss,
+                variance_weight=variance_config['weight'],
+                covariance_weight=variance_config.get('covariance_weight', 0.0),
+                feature_std=feat_std,
+                avg_cos_sim=avg_cos_sim,
+                target_std=variance_config.get('target_std', 1.0),
+                uniformity_loss=uni_loss,                                    # 🆕
+                uniformity_weight=variance_config.get('uniformity_weight', 0.0)  # 🆕
+            )
+            monitor.log_collapse_detection(
+                epoch, collapse_info['feat_std'],
+                collapse_info['avg_cos_sim'], is_collapsed
+            )
+
+            # ✅ 학습 완료 후 즉시 temp_checkpoint 저장 (pending=False)
+            temp_ckpt_path = os.path.join(config['save_dir'], 'temp_checkpoint.pth')
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, val_loss, temp_ckpt_path,
+                best_val_loss=best_val_loss,
+                best_composite=best_composite,
+                config=config,
+                pending_evaluation=False
+            )
+
+        # =====================================================
+        # 평가 단계
+        # =====================================================
+        # Evaluate periodically
+        eval_time = None
+        temp_ckpt_path = os.path.join(config['save_dir'], 'temp_checkpoint.pth')
+        should_eval = monitor.should_evaluate(epoch) or (pending_evaluation and epoch == start_epoch)
+        if should_eval:
+            # ✅ evaluation 전: pending 플래그 True로 저장
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, val_loss, temp_ckpt_path,
+                best_val_loss=best_val_loss,
+                best_composite=best_composite,
+                config=config,
+                pending_evaluation=True  # ✅ 평가 미완료 표시
+            )
+
+            t0 = time.time()
+            try:
+                print(f"\nPerforming evaluation at epoch {epoch+1}...")
+
+                # pending resume 시 avg_cos_sim이 없으면 collapse detection으로 계산
+                if skip_training:
+                    with torch.no_grad():
+                        sample_batch = next(iter(val_loader))
+                        if isinstance(sample_batch, (list, tuple)):
+                            sample_batch = sample_batch[0]
+                        sample_batch = sample_batch[:min(32, len(sample_batch))].to(device)
+                        sample_features = model.get_embeddings(sample_batch, use_target=True)
+                        _, collapse_info = detect_collapse(sample_features)
+                        avg_cos_sim = collapse_info['avg_cos_sim']
+
+                # evaluation 직전에만 임시 생성
+                eval_loader = torch.utils.data.DataLoader(
+                    val_loader.dataset,
+                    batch_size=val_loader.batch_size,
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=False,
+                    collate_fn=collate_fn,
+                )
+
+                eval_metrics, cluster_labels = evaluate_all(
+                    model, eval_loader, device, n_samples_invariance=100,
+                    k_knn=config['k_knn'], log_dir=config['log_dir']
+                )
+                print_evaluation_results(eval_metrics)
+                monitor.log_evaluation(epoch, eval_metrics)
+
+                if epoch == start_epoch + config['eval_frequency'] - 1:
+                    print_gpu_memory("After First Evaluation (Overall Peak)")
+
+                # features, _ = extract_features(model, val_loader, device, use_target=True, verbose=False)
+                # visualize_latent_space(
+                #     features[:1000],
+                #     labels=cluster_labels[:1000] if cluster_labels is not None else None,
+                #     method='tsne',
+                #     save_path=os.path.join(config['log_dir'], f'latent_space_epoch_{epoch+1}.png'),
+                #     title=f'Latent Space (Epoch {epoch+1})'
+                # )
+
+                composite_weights = config.get('composite_weights', {
+                    'knn_consistency': 0.5, 'silhouette': 0.3, 'avg_cos_sim': -0.2
+                })
+
+                # 개선: collapse_info의 에폭 끝 cos_sim 사용
+                epoch_end_cos_sim = collapse_info['avg_cos_sim']
+                current_composite, knn_consistency, silhouette = compute_composite_score(
+                    eval_metrics, epoch_end_cos_sim, composite_weights
+                )
+
+                if current_composite is not None:
+                    print(f"  📊 Composite Score: {current_composite:.4f} (knn: {knn_consistency}, sil: {silhouette}, cos: {avg_cos_sim}) (best: {best_composite:.4f})")
+
+                    if current_composite > best_composite:
+                        best_composite = current_composite
+                        save_path = os.path.join(config['save_dir'], 'best_model.pth')
+                        save_checkpoint(
+                            model, optimizer, scheduler, epoch, val_loss, save_path,
+                            best_val_loss=best_val_loss,
+                            best_composite=best_composite,
+                            config=config
+                        )
+                        knn = eval_metrics.get('knn_consistency', {}).get('knn_consistency')
+                        sil = eval_metrics.get('clustering', {}).get('silhouette', 0)
+                        rot = eval_metrics.get('rotation_invariance', {}).get('avg_cosine_similarity', 0)
+                        print(f"  🏆 Best model saved! composite={current_composite:.4f} "
+                            f"(knn={knn:.3f}, sil={sil:.3f}, rot={rot:.3f}, cos={avg_cos_sim:.3f})")
+
+                    if early_stopping(current_composite):
+                        print(f"\n⏹ Early stopping at epoch {epoch+1} "
+                            f"(composite score not improving for {config['early_stopping_patience']} evaluations)")
+                        break
+
+                # ✅ evaluation 성공: pending=False로 덮어쓰기
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, val_loss, temp_ckpt_path,
+                    best_val_loss=best_val_loss,
+                    best_composite=best_composite,
+                    config=config,
+                    pending_evaluation=False
+                )
+
+            except Exception as e:
+                print(f"\n⚠️ Evaluation failed at epoch {epoch+1}: {e}")
+                print(f"  temp_checkpoint 보존 (pending_evaluation=True)")
+                print(f"  resume_path를 temp_checkpoint.pth로 설정하면 evaluation 재시도")
+                break
+
+            eval_time = time.time() - t0
+            pending_evaluation = False  # ✅ 이번 루프에서는 해소
+
+        # =====================================================
+        # 로깅 및 정기 저장 (학습을 건너뛴 epoch에서는 스킵)
+        # =====================================================
+        if not skip_training:
+            total_time = time.time() - epoch_start_time
+            timing_info = {
+                'train': train_time,
+                'validate': validate_time,
+                'collapse_detection': collapse_time,
+                'evaluate': eval_time,
+                'total': total_time
+            }
+
+            mem = psutil.virtual_memory()
+
+            log_training_info(
+                epoch, train_loss, val_loss, byol_loss, var_loss, cov_loss, uni_loss, current_lr, tau,
+                timing_info, mem, variance_config, collapse_info
+            )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+
+            if epoch == 0 or (epoch + 1) % config['save_frequency'] == 0:
+                save_path = os.path.join(config['save_dir'], f'checkpoint_epoch_{epoch+1}.pth')
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, val_loss, save_path,
+                    best_val_loss=best_val_loss,
+                    best_composite=best_composite,
+                    config=config
+                )
+
+            if epoch == 0 or (epoch + 1) % config['save_frequency'] == 0:
+                monitor.plot_training_curves()
+                monitor.plot_evaluation_metrics()
+                monitor.save_history()
+
+    # Final evaluation
+    print("\n" + "="*60)
+    print("FINAL EVALUATION")
+    print("="*60)
+
+    eval_metrics, cluster_labels = evaluate_all(
+        model, val_loader, device, n_samples_invariance=200, k_knn=config['k_knn'], log_dir=config['log_dir']
+    )
+    print_evaluation_results(eval_metrics)
+
+    # ✅ 추가: Final Evaluation 결과를 history에 저장
+    monitor.log_evaluation(epoch, eval_metrics)
+
+    # Save final model
+    save_path = os.path.join(config['save_dir'], 'final_model.pth')
+    save_checkpoint(
+        model, optimizer, scheduler, epoch, val_loss, save_path,
+        best_val_loss=best_val_loss,  # 🔴 추가
+        config=config, eval_metrics=eval_metrics
+    )
+
+    # Final plots
+    monitor.plot_training_curves()
+    monitor.plot_evaluation_metrics()
+    monitor.save_history()
+    monitor.print_summary()
+
+    # Final visualization
+    features, _, _ = extract_features(model, val_loader, device, use_target=True)
+    visualize_latent_space(
+        features,
+        labels=cluster_labels,
+        method='tsne',
+        save_path=os.path.join(config['log_dir'], 'final_latent_space.png'),
+        title='Final Latent Space'
+    )
+
+    # ✅ 추가: 학습 요약 생성
+    print("\n" + "="*60)
+    print("Generating Training Summary...")
+    print("="*60)
+    
+    from utils.training_summary import generate_training_summary
+    generate_training_summary(log_dir=config['log_dir'], interval=config['save_frequency'])
+
+    client.upload_file(Filename=f"./logs_{file_number}/history.json", Bucket="DX", Key=f"EDS_MAP/training_logs/history.json")
+    client.upload_file(Filename=f"./logs_{file_number}/training_summary.csv", Bucket="DX", Key=f"EDS_MAP/training_logs/training_summary.csv")
+    
+    print("\nTraining completed!")
+
+
+def get_default_config(path, file_number):
+    """Get default configuration"""
+    config = {
+        # Data - Multiple wafer data sources
+        'data_configs': [
+            {"path": f"{path}/dataset/extract_multi_channel/dataset/root/root_map_data_bin_cat_map.npz", "name": "Root"},
+            {"path": f"{path}/dataset/extract_multi_channel/dataset/rose/rose_map_data_bin_cat_map.npz", "name": "Rose"},
+            {"path": f"{path}/dataset/extract_multi_channel/dataset/santa/santa_map_data_bin_cat_map.npz", "name": "Santa"},
+            {"path": f"{path}/dataset/extract_multi_channel/dataset/zuma_pro/zuma_pro_map_data_bin_cat_map.npz", "name": "Zuma_pro"},
+            {"path": f"{path}/dataset/extract_multi_channel/dataset/thetis/thetis_map_data_bin_cat_map.npz", "name": "Thetis"}
+        ],
+        'use_filter': True,
+        'use_density_aware': True,
+        'use_region_aware': False,
+        'test_size': 0.2,
+
+        # Data parameters
+        'wafer_size': 128,
+        'batch_size': 256,
+
+        # Model
+        'encoder_dim': 512,
+        'projector_hidden': 1024,
+        'projector_out': 256,
+        'predictor_hidden': 1024,
+        'use_radial_encoding': True,
+        'use_attention': True,
+
+        # Training
+        'epochs': 100,
+        # 'base_lr': 0.0001,
+        'base_lr': 0.00005,
+        'weight_decay': 0.01,
+
+        # BYOL
+        'tau_base': 0.996,
+        'tau_max': 0.999,
+
+        # Augmentation
+        'augmentation_type': 'strong',
+
+        # Scheduler
+        'T_0': 100,
+        'T_mult': 1,
+        # 'eta_max': 0.001,
+        'eta_max': 0.0005,
+        'T_up': 5,
+        'gamma': 0.9,
+        
+        # Variance Regularization (Target Std)
+        'variance_type': 'target_std_robust',  # 'target_std' or 'target_std_robust'
+        'variance_target_std': 1.0,            # 목표 std
+        'variance_margin': 0.1,                # robust margin (0.9~1.1 허용)
+        'variance_weight': 0.05,                # loss weight (0.2 -> 0.05)
+        'covariance_weight': 0.01,              # 🆕 (0.04 -> 0.1 -> 0.05)
+        'uniformity_weight': 0.005,
+        'uniformity_warmup_end': 10,   # 0~9 에폭: uniformity 꺼둠
+        'uniformity_rampup_end': 20,   # 10~19 에폭: 0→0.005 선형 증가
+
+        # Composite score weights (early stopping & best model 기준)
+        'composite_weights': {
+            'knn_consistency': 0.5,
+            'silhouette': 0.3,
+            'avg_cos_sim': -0.2,  # 음수 = 낮을수록 좋음
+        },
+
+        # K in KNN
+        'k_knn': 20,
+
+        # Monitoring
+        'eval_frequency': 5,
+        'save_frequency': 5,
+
+        # Early stopping
+        'early_stopping_patience': 6,          # eval_frequence * early_stopping_patience로 실제 early_stopping 적용
+        'early_stopping_delta': 0.01,
+        'early_stopping_mode': 'max',          # min, max 중 하나
+
+        # bin category channel
+        'n_spatial_channels' : 13,             # BIN Category Channel 수
+
+        # Paths
+        'save_dir': 'checkpoints_'+file_number,
+        'log_dir': 'logs_'+file_number,
+        'resume_path': None
+        # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints_{file_number}/best_model.pth"
+        # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints_{file_number}/checkpoint_epoch_30.pth"
+        # 'resume_path': f"{path}/clustering/byol_multi_channel/checkpoints_{file_number}/temp_checkpoint.pth"
+    }
+
+    return config
+
+
+def main():
+    """Main entry point"""
+    path = '/mnt/kh0213.jang/Documents/wm811k'
+    base_path = path + "/clustering/pth_file"
+    today = datetime.today()
+    result = today.strftime("%y%m%d")
+    file_number = int(os.path.splitext(os.path.basename(__file__))[0].split('_')[-1]),
+
+    # Get default config
+    config = get_default_config(path=path, file_number=file_number)
+
+    # Start training
+    train_byol_wafer(config, file_number)
 
 
 if __name__ == "__main__":
-    # Note: This will only work if models and utils are properly set up
-    try:
-        test_training_functions()
-    except ImportError as e:
-        print(f"Import error: {e}")
-        print("Run from project root with proper PYTHONPATH")
+    main()
