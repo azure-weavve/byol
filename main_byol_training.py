@@ -553,9 +553,6 @@ def train_byol_wafer(config, file_number):
                 timing_info, mem, variance_config, collapse_info
             )
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-
             if epoch == 0 or (epoch + 1) % config['save_frequency'] == 0:
                 save_path = os.path.join(config['save_dir'], f'checkpoint_epoch_{epoch+1}.pth')
                 save_checkpoint(
@@ -717,7 +714,7 @@ def main():
     base_path = path + "/clustering/pth_file"
     today = datetime.today()
     result = today.strftime("%y%m%d")
-    file_number = int(os.path.splitext(os.path.basename(__file__))[0].split('_')[-1])
+    file_number = str(int(os.path.splitext(os.path.basename(__file__))[0].split('_')[-1]))
 
     # Get default config
     config = get_default_config(path=path, file_number=file_number)
